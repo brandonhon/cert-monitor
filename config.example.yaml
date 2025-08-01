@@ -1,0 +1,12 @@
+# Example configuration for cert-monitor
+cert_dirs:
+  - ./certs
+  - /etc/ssl/certs
+log_file: /var/log/cert-monitor.log
+port: "3000"
+bind_address: "0.0.0.0"
+num_workers: 4
+expiry_threshold_days: 45
+cache_file: /var/lib/cert-monitor/cache.json
+enable_runtime_metrics: true
+enable_weak_crypto_metrics: true
