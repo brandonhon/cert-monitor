@@ -1,0 +1,44 @@
+# cert-monitor configuration example
+# Copy this file to config.yaml and customize as needed
+
+# Certificate directories to monitor
+# These directories will be scanned recursively for certificate files
+cert_dirs:
+  - "/etc/ssl/certs"
+  - "/usr/local/share/ca-certificates"
+  - "/opt/certs"
+
+# Logging configuration
+log_file: "/var/log/cert-monitor.log"
+
+# HTTP server configuration
+port: "3000"
+bind_address: "0.0.0.0"
+
+# Processing configuration
+num_workers: 4
+dry_run: false
+
+# Certificate expiration threshold (days)
+# Certificates expiring within this timeframe will be flagged
+expiry_threshold_days: 30
+
+# Cache configuration
+cache_file: "/var/lib/cert-monitor/cache.json"
+clear_cache_on_reload: false
+
+# TLS configuration (optional)
+# Uncomment and configure to enable HTTPS for the metrics endpoint
+# tls_cert_file: "/path/to/server.crt"
+# tls_key_file: "/path/to/server.key"
+
+# Feature flags
+enable_pprof: false
+enable_runtime_metrics: true
+enable_weak_crypto_metrics: true
+
+# Directory exclusions (future feature)
+# excluded_dirs:
+#   - "old"
+#   - "backup"
+#   - "archive"
