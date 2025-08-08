@@ -16,7 +16,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
-	"cert-monitor/internal/config"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -75,58 +74,12 @@ var (
 	Commit  = "none"
 )
 
-// // Global state management
-// type GlobalState struct {
-// 	config         *Config
-// 	configMutex    sync.RWMutex
-// 	configFilePath string
-// 	reloadCh       chan struct{}
-	
-// 	// Scan backoff tracking
-// 	scanBackoff     map[string]time.Time
-// 	scanBackoffLock sync.Mutex
-	
-// 	// File system watcher management
-// 	watchedDirs     map[string]bool
-// 	watchedDirsLock sync.Mutex
-// 	mainWatcher     *fsnotify.Watcher
-	
-// 	// Certificate cache
-// 	certCache     map[string]CachedCertMeta
-// 	certCacheLock sync.RWMutex
-// 	cacheFilePath string
-// 	cacheHits     int64
-// 	cacheMisses   int64
-// }
-
-// CachedCertMeta holds metadata for cached certificates
-type CachedCertMeta struct {
-	Fingerprint [32]byte  `json:"fingerprint"`
-	ModTime     time.Time `json:"mod_time"`
-	Size        int64     `json:"size"`
-}
-
-// // Config holds all runtime configuration
-// type Config struct {
-// 	CertDirs                []string `yaml:"cert_dirs"`
-// 	LogFile                 string   `yaml:"log_file"`
-// 	Port                    string   `yaml:"port"`
-// 	BindAddress             string   `yaml:"bind_address"`
-// 	NumWorkers              int      `yaml:"num_workers"`
-// 	DryRun                  bool     `yaml:"dry_run"`
-// 	ExpiryThresholdDays     int      `yaml:"expiry_threshold_days"`
-// 	ClearCacheOnReload      bool     `yaml:"clear_cache_on_reload"`
-// 	TLSCertFile             string   `yaml:"tls_cert_file"`
-// 	TLSKeyFile              string   `yaml:"tls_key_file"`
-// 	EnablePprof             bool     `yaml:"enable_pprof"`
-// 	EnableRuntimeMetrics    bool     `yaml:"enable_runtime_metrics"`
-// 	EnableWeakCryptoMetrics bool     `yaml:"enable_weak_crypto_metrics"`
-// 	CacheFile               string   `yaml:"cache_file"`
-
-// Global state management (without config - now managed by config.Manager)
+// Global state management
 type GlobalState struct {
-	configManager   *config.Manager
-	reloadCh        chan struct{}
+	config         *Config
+	configMutex    sync.RWMutex
+	configFilePath string
+	reloadCh       chan struct{}
 	
 	// Scan backoff tracking
 	scanBackoff     map[string]time.Time
@@ -143,6 +96,31 @@ type GlobalState struct {
 	cacheFilePath string
 	cacheHits     int64
 	cacheMisses   int64
+}
+
+// CachedCertMeta holds metadata for cached certificates
+type CachedCertMeta struct {
+	Fingerprint [32]byte  `json:"fingerprint"`
+	ModTime     time.Time `json:"mod_time"`
+	Size        int64     `json:"size"`
+}
+
+// Config holds all runtime configuration
+type Config struct {
+	CertDirs                []string `yaml:"cert_dirs"`
+	LogFile                 string   `yaml:"log_file"`
+	Port                    string   `yaml:"port"`
+	BindAddress             string   `yaml:"bind_address"`
+	NumWorkers              int      `yaml:"num_workers"`
+	DryRun                  bool     `yaml:"dry_run"`
+	ExpiryThresholdDays     int      `yaml:"expiry_threshold_days"`
+	ClearCacheOnReload      bool     `yaml:"clear_cache_on_reload"`
+	TLSCertFile             string   `yaml:"tls_cert_file"`
+	TLSKeyFile              string   `yaml:"tls_key_file"`
+	EnablePprof             bool     `yaml:"enable_pprof"`
+	EnableRuntimeMetrics    bool     `yaml:"enable_runtime_metrics"`
+	EnableWeakCryptoMetrics bool     `yaml:"enable_weak_crypto_metrics"`
+	CacheFile               string   `yaml:"cache_file"`
 }
 
 // MetricsCollector encapsulates all Prometheus metrics
@@ -201,7 +179,6 @@ var (
 
 func init() {
 	globalState = &GlobalState{
-		configManager: config.NewManager(),
 		scanBackoff: make(map[string]time.Time),
 		watchedDirs: make(map[string]bool),
 		certCache:   make(map[string]CachedCertMeta),
@@ -307,66 +284,66 @@ func registerMetrics() {
 	)
 }
 
-// // Configuration Management
-// // ========================
+// Configuration Management
+// ========================
 
-// // DefaultConfig returns a configuration with sensible defaults
-// func DefaultConfig() *Config {
-// 	return &Config{
-// 		CertDirs:            []string{"./certs"},
-// 		LogFile:             defaultLogPath(),
-// 		Port:                defaultPort,
-// 		BindAddress:         defaultBindAddress,
-// 		NumWorkers:          defaultWorkers,
-// 		DryRun:              false,
-// 		ExpiryThresholdDays: defaultExpiryDays,
-// 		ClearCacheOnReload:  false,
-// 		TLSCertFile:         "",
-// 		TLSKeyFile:          "",
-// 		CacheFile:           "/var/lib/cert-monitor/cache.json",
-// 	}
-// }
+// DefaultConfig returns a configuration with sensible defaults
+func DefaultConfig() *Config {
+	return &Config{
+		CertDirs:            []string{"./certs"},
+		LogFile:             defaultLogPath(),
+		Port:                defaultPort,
+		BindAddress:         defaultBindAddress,
+		NumWorkers:          defaultWorkers,
+		DryRun:              false,
+		ExpiryThresholdDays: defaultExpiryDays,
+		ClearCacheOnReload:  false,
+		TLSCertFile:         "",
+		TLSKeyFile:          "",
+		CacheFile:           "/var/lib/cert-monitor/cache.json",
+	}
+}
 
-// // LoadConfig loads configuration from a YAML file with comprehensive validation
-// func LoadConfig(path string) error {
-// 	if path == "" {
-// 		log.Debug("No config path provided, using defaults")
-// 		return nil
-// 	}
+// LoadConfig loads configuration from a YAML file with comprehensive validation
+func LoadConfig(path string) error {
+	if path == "" {
+		log.Debug("No config path provided, using defaults")
+		return nil
+	}
 	
-// 	// Validate file accessibility
-// 	if err := validateFileAccess(path); err != nil {
-// 		return fmt.Errorf("config file validation failed: %w", err)
-// 	}
+	// Validate file accessibility
+	if err := validateFileAccess(path); err != nil {
+		return fmt.Errorf("config file validation failed: %w", err)
+	}
 	
-// 	data, err := os.ReadFile(path)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to read config file %q: %w", path, err)
-// 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read config file %q: %w", path, err)
+	}
 	
-// 	// Parse into temporary config for validation
-// 	cfg := DefaultConfig()
-// 	if err := yaml.Unmarshal(data, cfg); err != nil {
-// 		return fmt.Errorf("failed to parse config file %q: %w", path, err)
-// 	}
+	// Parse into temporary config for validation
+	cfg := DefaultConfig()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("failed to parse config file %q: %w", path, err)
+	}
 
-// 	// Validate configuration before applying
-// 	if err := validateConfig(cfg); err != nil {
-// 		return fmt.Errorf("invalid configuration in %q: %w", path, err)
-// 	}
+	// Validate configuration before applying
+	if err := validateConfig(cfg); err != nil {
+		return fmt.Errorf("invalid configuration in %q: %w", path, err)
+	}
 	
-// 	// Atomically update global config
-// 	globalState.setConfig(cfg)
+	// Atomically update global config
+	globalState.setConfig(cfg)
 	
-// 	log.WithFields(log.Fields{
-// 		"config_file": path,
-// 		"cert_dirs":   len(cfg.CertDirs),
-// 		"port":        cfg.Port,
-// 		"workers":     cfg.NumWorkers,
-// 	}).Info("Configuration loaded successfully")
+	log.WithFields(log.Fields{
+		"config_file": path,
+		"cert_dirs":   len(cfg.CertDirs),
+		"port":        cfg.Port,
+		"workers":     cfg.NumWorkers,
+	}).Info("Configuration loaded successfully")
 
-// 	return nil
-// }
+	return nil
+}
 
 // validateConfig performs comprehensive validation of configuration values
 func validateConfig(cfg *Config) error {
@@ -534,25 +511,21 @@ func validateDirectoryCreation(dir string) error {
 	return nil
 }
 
-// // Global State Management
-// // ======================
+// Global State Management
+// ======================
 
-// // getConfig safely retrieves the current configuration
-// func (gs *GlobalState) getConfig() *Config {
-// 	gs.configMutex.RLock()
-// 	defer gs.configMutex.RUnlock()
-// 	return gs.config
-// }
+// getConfig safely retrieves the current configuration
+func (gs *GlobalState) getConfig() *Config {
+	gs.configMutex.RLock()
+	defer gs.configMutex.RUnlock()
+	return gs.config
+}
 
-// // setConfig safely updates the global configuration
-// func (gs *GlobalState) setConfig(cfg *Config) {
-// 	gs.configMutex.Lock()
-// 	defer gs.configMutex.Unlock()
-// 	gs.config = cfg
-
-// getConfig safely retrieves the current configuration through the manager
-func (gs *GlobalState) getConfig() *config.Config {
-	return gs.configManager.Get()
+// setConfig safely updates the global configuration
+func (gs *GlobalState) setConfig(cfg *Config) {
+	gs.configMutex.Lock()
+	defer gs.configMutex.Unlock()
+	gs.config = cfg
 }
 
 // Cache Management
@@ -2700,8 +2673,7 @@ func (a *arrayFlags) Set(value string) error {
 // parseCommandLineFlags parses and applies command line flags
 func parseCommandLineFlags() *Config {
 	var (
-		// certDirs    arrayFlags
-		certDirs	config.ArrayFlags
+		certDirs    arrayFlags
 		logFile     string
 		port        string
 		bindAddr    string
@@ -2733,12 +2705,8 @@ func parseCommandLineFlags() *Config {
 
 	flag.Parse()
 
-	// // Store config file path globally
-	// globalState.configFilePath = configFile
-	
-	// Store config file path in manager
-	// (This will be handled by LoadFromFile)
-
+	// Store config file path globally
+	globalState.configFilePath = configFile
 
 	// Handle config validation mode
 	if checkConfig {
@@ -2746,33 +2714,22 @@ func parseCommandLineFlags() *Config {
 	}
 
 	// Load configuration from file
-	// if err := LoadConfig(configFile); err != nil {
-	if err := globalState.configManager.LoadFromFile(configFile); err != nil {
+	if err := LoadConfig(configFile); err != nil {
 		log.WithError(err).Fatal("Failed to load configuration")
 	}
 
-	// // Apply command line overrides
-	// cfg := globalState.getConfig()
-	// if cfg == nil {
-	// 	cfg = DefaultConfig()
-	// 	globalState.setConfig(cfg)
-	// }
+	// Apply command line overrides
+	cfg := globalState.getConfig()
+	if cfg == nil {
+		cfg = DefaultConfig()
+		globalState.setConfig(cfg)
+	}
 
-	// applyCommandLineOverrides(cfg, &certDirs, logFile, port, bindAddr, numWorkers,
-	err := globalState.configManager.ApplyCommandLineOverrides(&certDirs, logFile, port, bindAddr, numWorkers, 
+	applyCommandLineOverrides(cfg, &certDirs, logFile, port, bindAddr, numWorkers, 
 		dryRun, expiryDays, clearCache, tlsCert, tlsKey, enablePprof)
-	if err != nil {
-		log.WithError(err).Fatal("Failed to apply command line overrides")
-	}
-	// applyEnvironmentOverrides(cfg)
+	applyEnvironmentOverrides(cfg)
 
-	err = globalState.configManager.ApplyEnvironmentOverrides()
-	if err != nil {
-		log.WithError(err).Fatal("Failed to apply environment overrides")
-	}
-
-	// return cfg
-	return globalState.getConfig()
+	return cfg
 }
 
 // handleConfigValidation validates configuration and exits
