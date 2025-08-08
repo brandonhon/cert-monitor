@@ -103,10 +103,21 @@ jobs:
       with:
         go-version: 1.21
     
+    - name: Download and install Gosec
+      run: |
+        curl -sfL https://raw.githubusercontent.com/securecodewarrior/gosec/master/install.sh | sh -s -- -b $(go env GOPATH)/bin latest
+        echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+    
     - name: Run Gosec Security Scanner
-      uses: securecodewarrior/github-action-gosec@master
+      run: |
+        gosec -fmt sarif -out gosec-results.sarif ./...
+        gosec ./...
+    
+    - name: Upload Gosec results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
       with:
-        args: './...'
+        sarif_file: gosec-results.sarif
 
   format-check:
     runs-on: ubuntu-latest
