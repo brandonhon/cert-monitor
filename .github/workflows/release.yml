@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: 1.21
+    
+    - name: Get version
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    
+    - name: Build all platforms
+      run: |
+        VERSION=${{ steps.get_version.outputs.VERSION }}
+        COMMIT=$(git rev-parse --short HEAD)
+        make VERSION=$VERSION COMMIT=$COMMIT build-all
+    
+    - name: Create checksums
+      run: |
+        cd build
+        sha256sum * > checksums.txt
+    
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Simple changelog generation
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        if [ -n "$PREVIOUS_TAG" ]; then
+          echo "## Changes since $PREVIOUS_TAG" > CHANGELOG.md
+          git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD >> CHANGELOG.md
+        else
+          echo "## Initial Release" > CHANGELOG.md
+          echo "First release of cert-monitor" >> CHANGELOG.md
+        fi
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      id: create_release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.VERSION }}
+        release_name: Release ${{ steps.get_version.outputs.VERSION }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: false
+    
+    - name: Upload Linux AMD64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./build/cert-monitor-linux-amd64
+        asset_name: cert-monitor-linux-amd64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Linux ARM64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./build/cert-monitor-linux-arm64
+        asset_name: cert-monitor-linux-arm64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Windows AMD64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./build/cert-monitor-windows-amd64.exe
+        asset_name: cert-monitor-windows-amd64.exe
+        asset_content_type: application/octet-stream
+    
+    - name: Upload macOS AMD64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./build/cert-monitor-darwin-amd64
+        asset_name: cert-monitor-darwin-amd64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload macOS ARM64
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./build/cert-monitor-darwin-arm64
+        asset_name: cert-monitor-darwin-arm64
+        asset_content_type: application/octet-stream
+    
+    - name: Upload checksums
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./build/checksums.txt
+        asset_name: checksums.txt
+        asset_content_type: text/plain
