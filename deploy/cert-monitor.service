@@ -1,0 +1,49 @@
+# Systemd service file for cert-monitor
+# Install to: /etc/systemd/system/cert-monitor.service
+
+[Unit]
+Description=SSL Certificate Monitor
+Documentation=https://github.com/brandonhon/cert-monitor
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=cert-monitor
+Group=cert-monitor
+ExecStart=/usr/local/bin/cert-monitor -config /etc/cert-monitor/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cert-monitor
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/cert-monitor /var/lib/cert-monitor
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment
+Environment="CERT_DIRS=/etc/ssl/certs:/usr/local/share/ca-certificates"
+Environment="LOG_FILE=/var/log/cert-monitor/cert-monitor.log"
+Environment="CACHE_FILE=/var/lib/cert-monitor/cache.json"
+
+[Install]
+WantedBy=multi-user.target

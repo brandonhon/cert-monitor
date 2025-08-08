@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  cert-monitor:
+    build: .
+    container_name: cert-monitor
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount certificate directories (customize as needed)
+      - /etc/ssl/certs:/certs/system:ro
+      - /usr/local/share/ca-certificates:/certs/local:ro
+      # Configuration
+      - ./config.yaml:/etc/cert-monitor/config.yaml:ro
+      # Persistent data
+      - cert-monitor-logs:/var/log/cert-monitor
+      - cert-monitor-cache:/var/lib/cert-monitor
+    environment:
+      - CERT_DIRS=/certs/system:/certs/local
+      - PORT=3000
+      - LOG_FILE=/var/log/cert-monitor/cert-monitor.log
+      - CACHE_FILE=/var/lib/cert-monitor/cache.json
+      - ENABLE_RUNTIME_METRICS=true
+      - ENABLE_WEAK_CRYPTO_METRICS=true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - cert-monitor
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+
+volumes:
+  cert-monitor-logs:
+  cert-monitor-cache:
+  prometheus-data:
+  grafana-data:
