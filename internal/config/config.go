@@ -4,103 +4,104 @@ import (
 	"fmt"
 	"os"
 
-	"gopkg.in/yaml.v3"
+	"github.com/brandonhon/cert-monitor/pkg/utils"
+	yaml "gopkg.in/yaml.v3"
 )
 
-// Config represents the application configuration
-type Config struct {
-	CertDirs                []string      `yaml:"cert_dirs"`
-	LogFile                 string        `yaml:"log_file"`
-	Port                    string        `yaml:"port"`
-	BindAddress             string        `yaml:"bind_address"`
-	NumWorkers              int           `yaml:"num_workers"`
-	DryRun                  bool          `yaml:"dry_run"`
-	ExpiryThresholdDays     int           `yaml:"expiry_threshold_days"`
-	ClearCacheOnReload      bool          `yaml:"clear_cache_on_reload"`
-	TLSCertFile             string        `yaml:"tls_cert_file"`
-	TLSKeyFile              string        `yaml:"tls_key_file"`
-	EnablePprof             bool          `yaml:"enable_pprof"`
-	EnableRuntimeMetrics    bool          `yaml:"enable_runtime_metrics"`
-	EnableWeakCryptoMetrics bool          `yaml:"enable_weak_crypto_metrics"`
-	CacheFile               string        `yaml:"cache_file"`
-	Server                  ServerConfig  `yaml:"server"`
-	Certificate             CertConfig    `yaml:"certificate"`
-	Cache                   CacheConfig   `yaml:"cache"`
-}
-
-// ServerConfig holds HTTP server configuration
-type ServerConfig struct {
-	Port        string `yaml:"port"`
-	BindAddress string `yaml:"bind_address"`
-	TLSCertFile string `yaml:"tls_cert_file"`
-	TLSKeyFile  string `yaml:"tls_key_file"`
-	EnablePprof bool   `yaml:"enable_pprof"`
-}
-
-// CertConfig holds certificate processing configuration
-type CertConfig struct {
-	Dirs                []string `yaml:"dirs"`
-	ExpiryThresholdDays int      `yaml:"expiry_threshold_days"`
-	NumWorkers          int      `yaml:"num_workers"`
-	EnableWeakCrypto    bool     `yaml:"enable_weak_crypto_metrics"`
-}
-
-// CacheConfig holds cache configuration
-type CacheConfig struct {
-	File               string `yaml:"file"`
-	ClearOnReload      bool   `yaml:"clear_on_reload"`
-}
-
-// Load loads configuration from file
+// Load loads configuration from a YAML file with comprehensive validation
 func Load(path string) (*Config, error) {
-	cfg := DefaultConfig()
-	
+	cfg := Default()
+
 	if path == "" {
 		return cfg, nil
 	}
 
+	// Validate file accessibility
+	if err := utils.ValidateFileAccess(path); err != nil {
+		return nil, fmt.Errorf("config file validation failed: %w", err)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, fmt.Errorf("failed to read config file %q: %w", path, err)
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, fmt.Errorf("failed to parse config file %q: %w", path, err)
 	}
 
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
+	if err := Validate(cfg); err != nil {
+		return nil, fmt.Errorf("invalid configuration in %q: %w", path, err)
 	}
 
 	return cfg, nil
 }
 
-// DefaultConfig returns default configuration
-func DefaultConfig() *Config {
+// Default returns a configuration with sensible defaults
+func Default() *Config {
 	return &Config{
 		CertDirs:            []string{"./certs"},
-		Port:                "3000",
-		BindAddress:         "0.0.0.0",
-		NumWorkers:          4,
-		ExpiryThresholdDays: 45,
-		CacheFile:           "/var/lib/cert-monitor/cache.json",
-		Server: ServerConfig{
-			Port:        "3000",
-			BindAddress: "0.0.0.0",
-		},
-		Certificate: CertConfig{
-			Dirs:                []string{"./certs"},
-			ExpiryThresholdDays: 45,
-			NumWorkers:          4,
-		},
-		Cache: CacheConfig{
-			File: "/var/lib/cert-monitor/cache.json",
-		},
+		LogFile:             defaultLogPath(),
+		Port:                DefaultPort,
+		BindAddress:         DefaultBindAddress,
+		NumWorkers:          DefaultWorkers,
+		DryRun:              false,
+		ExpiryThresholdDays: DefaultExpiryDays,
+		ClearCacheOnReload:  false,
+		TLSCertFile:         "",
+		TLSKeyFile:          "",
+		CacheFile:           DefaultCacheFile,
 	}
 }
 
-// Validate validates the configuration
-func (c *Config) Validate() error {
-	// TODO: Implement validation logic
-	return nil
+// Compare compares two configurations and returns differences
+func Compare(old, new *Config) Diff {
+	return Diff{
+		CertDirsChanged:          !equalStringSlices(old.CertDirs, new.CertDirs),
+		LogFileChanged:           old.LogFile != new.LogFile,
+		PortChanged:              old.Port != new.Port,
+		BindAddressChanged:       old.BindAddress != new.BindAddress,
+		NumWorkersChanged:        old.NumWorkers != new.NumWorkers,
+		TLSConfigChanged:         old.TLSCertFile != new.TLSCertFile || old.TLSKeyFile != new.TLSKeyFile,
+		RuntimeMetricsChanged:    old.EnableRuntimeMetrics != new.EnableRuntimeMetrics,
+		WeakCryptoMetricsChanged: old.EnableWeakCryptoMetrics != new.EnableWeakCryptoMetrics,
+		PprofChanged:             old.EnablePprof != new.EnablePprof,
+		CacheFileChanged:         old.CacheFile != new.CacheFile,
+		ExpiryThresholdChanged:   old.ExpiryThresholdDays != new.ExpiryThresholdDays,
+		ClearCacheChanged:        old.ClearCacheOnReload != new.ClearCacheOnReload,
+	}
+}
+
+// Helper functions
+
+func defaultLogPath() string {
+	if utils.IsWindows() {
+		return "C:\\Logs\\cert-monitor.log"
+	}
+	return "/var/log/cert-monitor.log"
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	mapA := make(map[string]bool)
+	mapB := make(map[string]bool)
+
+	for _, str := range a {
+		mapA[str] = true
+	}
+
+	for _, str := range b {
+		mapB[str] = true
+	}
+
+	for str := range mapA {
+		if !mapB[str] {
+			return false
+		}
+	}
+
+	return true
 }

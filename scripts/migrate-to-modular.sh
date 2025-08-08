@@ -22,7 +22,7 @@ echo -e "${BLUE}📋 Creating backup of current main.go...${NC}"
 cp main.go main.go.backup
 echo -e "${GREEN}✅ Backup created: main.go.backup${NC}"
 
-# Create modular directory structure
+# Create modular directory structure from MODULAR_ARCHITECTURE.md
 echo -e "${BLUE}📁 Creating modular package structure...${NC}"
 
 directories=(
@@ -41,6 +41,11 @@ directories=(
     "test/fixtures"
     "test/mocks"
 )
+
+for dir in "${directories[@]}"; do
+    mkdir -p "$dir"
+    echo -e "${GREEN}✅${NC} Created: $dir"
+done
 
 for dir in "${directories[@]}"; do
     mkdir -p "$dir"

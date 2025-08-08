@@ -3,8 +3,10 @@ package config
 import (
 	"fmt"
 	"net"
-	"os"
+	"path/filepath"
 	"strconv"
+
+	"github.com/brandonhon/cert-monitor/pkg/utils"
 )
 
 // ValidationError represents a configuration validation error
@@ -18,46 +20,59 @@ func (e ValidationError) Error() string {
 	return fmt.Sprintf("validation failed for field %s: %s", e.Field, e.Reason)
 }
 
-// ValidateConfig performs comprehensive configuration validation
-func ValidateConfig(cfg *Config) error {
-	if err := validateCertDirs(cfg.CertDirs); err != nil {
+// Validate performs comprehensive configuration validation
+func Validate(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("config cannot be nil")
+	}
+
+	if err := validateCertDirectories(cfg.CertDirs); err != nil {
 		return err
 	}
 
-	if err := validateServer(cfg.Server); err != nil {
+	if err := validateNetworkConfig(cfg.Port, cfg.BindAddress); err != nil {
 		return err
 	}
 
-	if err := validateWorkers(cfg.NumWorkers); err != nil {
+	if err := validateWorkerConfig(cfg.NumWorkers, cfg.ExpiryThresholdDays); err != nil {
+		return err
+	}
+
+	if err := validateTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+		return err
+	}
+
+	if err := validateFileConfig(cfg.LogFile, cfg.CacheFile); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func validateCertDirs(dirs []string) error {
-	if len(dirs) == 0 {
+// validateCertDirectories validates certificate directory configuration
+func validateCertDirectories(certDirs []string) error {
+	if len(certDirs) == 0 {
 		return ValidationError{
 			Field:  "cert_dirs",
-			Value:  dirs,
-			Reason: "at least one certificate directory must be specified",
+			Value:  certDirs,
+			Reason: "no certificate directories specified",
 		}
 	}
 
-	for i, dir := range dirs {
+	for i, dir := range certDirs {
 		if dir == "" {
 			return ValidationError{
 				Field:  fmt.Sprintf("cert_dirs[%d]", i),
 				Value:  dir,
-				Reason: "directory path cannot be empty",
+				Reason: "certificate directory is empty",
 			}
 		}
 
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if err := utils.ValidateDirectoryAccess(dir); err != nil {
 			return ValidationError{
 				Field:  fmt.Sprintf("cert_dirs[%d]", i),
 				Value:  dir,
-				Reason: "directory does not exist",
+				Reason: fmt.Sprintf("directory validation failed: %v", err),
 			}
 		}
 	}
@@ -65,31 +80,39 @@ func validateCertDirs(dirs []string) error {
 	return nil
 }
 
-func validateServer(cfg ServerConfig) error {
-	// Validate port
-	port, err := strconv.Atoi(cfg.Port)
+// validateNetworkConfig validates network-related configuration
+func validateNetworkConfig(port, bindAddress string) error {
+	if port == "" {
+		return ValidationError{
+			Field:  "port",
+			Value:  port,
+			Reason: "metrics port is not set",
+		}
+	}
+
+	portNum, err := strconv.Atoi(port)
 	if err != nil {
 		return ValidationError{
-			Field:  "server.port",
-			Value:  cfg.Port,
-			Reason: "invalid port number",
-		}
-	}
-
-	if port < 1 || port > 65535 {
-		return ValidationError{
-			Field:  "server.port",
+			Field:  "port",
 			Value:  port,
-			Reason: "port must be between 1 and 65535",
+			Reason: fmt.Sprintf("invalid port number: %v", err),
 		}
 	}
 
-	// Validate bind address
-	if cfg.BindAddress != "" {
-		if ip := net.ParseIP(cfg.BindAddress); ip == nil {
+	if portNum < 1 || portNum > 65535 {
+		return ValidationError{
+			Field:  "port",
+			Value:  portNum,
+			Reason: "port number is out of valid range (1-65535)",
+		}
+	}
+
+	// Validate bind address if specified
+	if bindAddress != "" && bindAddress != "0.0.0.0" {
+		if ip := net.ParseIP(bindAddress); ip == nil {
 			return ValidationError{
-				Field:  "server.bind_address",
-				Value:  cfg.BindAddress,
+				Field:  "bind_address",
+				Value:  bindAddress,
 				Reason: "invalid IP address",
 			}
 		}
@@ -98,20 +121,97 @@ func validateServer(cfg ServerConfig) error {
 	return nil
 }
 
-func validateWorkers(workers int) error {
-	if workers < 1 {
+// validateWorkerConfig validates worker and timing configuration
+func validateWorkerConfig(numWorkers, expiryThresholdDays int) error {
+	if numWorkers < 1 {
 		return ValidationError{
 			Field:  "num_workers",
-			Value:  workers,
-			Reason: "must be at least 1",
+			Value:  numWorkers,
+			Reason: "number of workers must be at least 1",
 		}
 	}
 
-	if workers > 100 {
+	if numWorkers > 100 {
 		return ValidationError{
 			Field:  "num_workers",
-			Value:  workers,
-			Reason: "excessive number of workers (max recommended: 100)",
+			Value:  numWorkers,
+			Reason: "number of workers seems excessive (max recommended: 100)",
+		}
+	}
+
+	if expiryThresholdDays < 1 {
+		return ValidationError{
+			Field:  "expiry_threshold_days",
+			Value:  expiryThresholdDays,
+			Reason: "expiry threshold days must be at least 1",
+		}
+	}
+
+	if expiryThresholdDays > 365 {
+		return ValidationError{
+			Field:  "expiry_threshold_days",
+			Value:  expiryThresholdDays,
+			Reason: "expiry threshold days seems excessive (max recommended: 365)",
+		}
+	}
+
+	return nil
+}
+
+// validateTLSConfig validates TLS certificate configuration
+func validateTLSConfig(tlsCertFile, tlsKeyFile string) error {
+	// Both must be specified or both must be empty
+	if (tlsCertFile != "") != (tlsKeyFile != "") {
+		return ValidationError{
+			Field:  "tls_config",
+			Value:  fmt.Sprintf("cert=%s, key=%s", tlsCertFile, tlsKeyFile),
+			Reason: "both TLS certificate and key files must be specified together",
+		}
+	}
+
+	// If both are specified, validate they exist
+	if tlsCertFile != "" && tlsKeyFile != "" {
+		if err := utils.ValidateFileAccess(tlsCertFile); err != nil {
+			return ValidationError{
+				Field:  "tls_cert_file",
+				Value:  tlsCertFile,
+				Reason: fmt.Sprintf("TLS certificate file validation failed: %v", err),
+			}
+		}
+
+		if err := utils.ValidateFileAccess(tlsKeyFile); err != nil {
+			return ValidationError{
+				Field:  "tls_key_file",
+				Value:  tlsKeyFile,
+				Reason: fmt.Sprintf("TLS key file validation failed: %v", err),
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateFileConfig validates log and cache file configuration
+func validateFileConfig(logFile, cacheFile string) error {
+	if logFile != "" {
+		logDir := filepath.Dir(logFile)
+		if err := utils.ValidateDirectoryCreation(logDir); err != nil {
+			return ValidationError{
+				Field:  "log_file",
+				Value:  logFile,
+				Reason: fmt.Sprintf("log file directory validation failed: %v", err),
+			}
+		}
+	}
+
+	if cacheFile != "" {
+		cacheDir := filepath.Dir(cacheFile)
+		if err := utils.ValidateDirectoryCreation(cacheDir); err != nil {
+			return ValidationError{
+				Field:  "cache_file",
+				Value:  cacheFile,
+				Reason: fmt.Sprintf("cache file directory validation failed: %v", err),
+			}
 		}
 	}
 

@@ -11,6 +11,8 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
@@ -32,8 +34,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/brandonhon/cert-monitor/internal/config"
-	"github.com/brandonhon/cert-monitor/pkg/utils"
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -41,7 +41,35 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
+	yaml "gopkg.in/yaml.v3"
+
+	// "github.com/brandonhon/cert-monitor/internal/config"
+    // "github.com/brandonhon/cert-monitor/pkg/utils"
 )
+
+// Constants for configuration limits and defaults
+const (
+	// maxSANsExported         = 10
+	// maxLabelLength          = 120
+	maxBackoff              = 10 * time.Minute
+	// defaultPort             = "3000"
+	// defaultBindAddress      = "0.0.0.0"
+	// defaultWorkers          = 4
+	// defaultExpiryDays       = 45
+	minDiskSpaceBytes       = 100 * 1024 * 1024 // 100MB
+	cacheWriteTimeout       = 5 * time.Second
+	watcherDebounce         = 2 * time.Second
+	runtimeMetricsInterval  = 10 * time.Second
+	gracefulShutdownTimeout = 10 * time.Second
+)
+
+// // Issuer codes for certificate classification
+// const (
+// 	IssuerCodeDigiCert   = 30
+// 	IssuerCodeAmazon     = 31
+// 	IssuerCodeOther      = 32
+// 	IssuerCodeSelfSigned = 33
+// )
 
 // Version info (injected at build time via -ldflags)
 var (
@@ -51,7 +79,7 @@ var (
 
 // Global state management
 type GlobalState struct {
-	config         *config.Config
+	config         *Config
 	configMutex    sync.RWMutex
 	configFilePath string
 	reloadCh       chan struct{}
@@ -79,6 +107,24 @@ type CachedCertMeta struct {
 	ModTime     time.Time `json:"mod_time"`
 	Size        int64     `json:"size"`
 }
+
+// // Config holds all runtime configuration
+// type Config struct {
+// 	CertDirs                []string `yaml:"cert_dirs"`
+// 	LogFile                 string   `yaml:"log_file"`
+// 	Port                    string   `yaml:"port"`
+// 	BindAddress             string   `yaml:"bind_address"`
+// 	NumWorkers              int      `yaml:"num_workers"`
+// 	DryRun                  bool     `yaml:"dry_run"`
+// 	ExpiryThresholdDays     int      `yaml:"expiry_threshold_days"`
+// 	ClearCacheOnReload      bool     `yaml:"clear_cache_on_reload"`
+// 	TLSCertFile             string   `yaml:"tls_cert_file"`
+// 	TLSKeyFile              string   `yaml:"tls_key_file"`
+// 	EnablePprof             bool     `yaml:"enable_pprof"`
+// 	EnableRuntimeMetrics    bool     `yaml:"enable_runtime_metrics"`
+// 	EnableWeakCryptoMetrics bool     `yaml:"enable_weak_crypto_metrics"`
+// 	CacheFile               string   `yaml:"cache_file"`
+// }
 
 // MetricsCollector encapsulates all Prometheus metrics
 type MetricsCollector struct {
@@ -125,6 +171,7 @@ type CacheStats struct {
 	CacheFilePath string  `json:"cache_file_path"`
 	HitRate       float64 `json:"hit_rate"`
 	LastPruneTime string  `json:"last_prune_time,omitempty"`
+	// CacheHitRate     string `json:"cache_hit_rate,omitempty"`
 }
 
 // Global instances
@@ -240,18 +287,245 @@ func registerMetrics() {
 	)
 }
 
+// Configuration Management
+// ========================
+
+// // DefaultConfig returns a configuration with sensible defaults
+// func DefaultConfig() *Config {
+// 	return &Config{
+// 		CertDirs:            []string{"./certs"},
+// 		LogFile:             defaultLogPath(),
+// 		Port:                defaultPort,
+// 		BindAddress:         defaultBindAddress,
+// 		NumWorkers:          defaultWorkers,
+// 		DryRun:              false,
+// 		ExpiryThresholdDays: defaultExpiryDays,
+// 		ClearCacheOnReload:  false,
+// 		TLSCertFile:         "",
+// 		TLSKeyFile:          "",
+// 		CacheFile:           "/var/lib/cert-monitor/cache.json",
+// 	}
+// }
+
+// // LoadConfig loads configuration from a YAML file with comprehensive validation
+// func LoadConfig(path string) error {
+// 	if path == "" {
+// 		log.Debug("No config path provided, using defaults")
+// 		return nil
+// 	}
+
+// 	// Validate file accessibility
+// 	if err := validateFileAccess(path); err != nil {
+// 		return fmt.Errorf("config file validation failed: %w", err)
+// 	}
+
+// 	data, err := os.ReadFile(path)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to read config file %q: %w", path, err)
+// 	}
+
+// 	// Parse into temporary config for validation
+// 	cfg := DefaultConfig()
+// 	if err := yaml.Unmarshal(data, cfg); err != nil {
+// 		return fmt.Errorf("failed to parse config file %q: %w", path, err)
+// 	}
+
+// 	// Validate configuration before applying
+// 	if err := validateConfig(cfg); err != nil {
+// 		return fmt.Errorf("invalid configuration in %q: %w", path, err)
+// 	}
+
+// 	// Atomically update global config
+// 	globalState.setConfig(cfg)
+
+// 	log.WithFields(log.Fields{
+// 		"config_file": path,
+// 		"cert_dirs":   len(cfg.CertDirs),
+// 		"port":        cfg.Port,
+// 		"workers":     cfg.NumWorkers,
+// 	}).Info("Configuration loaded successfully")
+
+// 	return nil
+// }
+
+// // validateConfig performs comprehensive validation of configuration values
+// func validateConfig(cfg *Config) error {
+// 	if cfg == nil {
+// 		return fmt.Errorf("config cannot be nil")
+// 	}
+
+// 	if err := validateCertDirectories(cfg.CertDirs); err != nil {
+// 		return err
+// 	}
+
+// 	if err := validateNetworkConfig(cfg.Port, cfg.BindAddress); err != nil {
+// 		return err
+// 	}
+
+// 	if err := validateWorkerConfig(cfg.NumWorkers, cfg.ExpiryThresholdDays); err != nil {
+// 		return err
+// 	}
+
+// 	if err := validateTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+// 		return err
+// 	}
+
+// 	if err := validateFileConfig(cfg.LogFile, cfg.CacheFile); err != nil {
+// 		return err
+// 	}
+
+// 	return nil
+// }
+
+// // validateCertDirectories validates certificate directory configuration
+// func validateCertDirectories(certDirs []string) error {
+// 	if len(certDirs) == 0 {
+// 		return fmt.Errorf("no certificate directories specified")
+// 	}
+
+// 	for i, dir := range certDirs {
+// 		if dir == "" {
+// 			return fmt.Errorf("certificate directory %d is empty", i)
+// 		}
+
+// 		if err := validateDirectoryAccess(dir); err != nil {
+// 			return fmt.Errorf("certificate directory %q validation failed: %w", dir, err)
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+// // validateNetworkConfig validates network-related configuration
+// func validateNetworkConfig(port, bindAddress string) error {
+// 	if port == "" {
+// 		return fmt.Errorf("metrics port is not set")
+// 	}
+
+// 	portNum, err := strconv.Atoi(port)
+// 	if err != nil {
+// 		return fmt.Errorf("invalid port number %q: %w", port, err)
+// 	}
+
+// 	if portNum < 1 || portNum > 65535 {
+// 		return fmt.Errorf("port number %d is out of valid range (1-65535)", portNum)
+// 	}
+
+// 	return nil
+// }
+
+// // validateWorkerConfig validates worker and timing configuration
+// func validateWorkerConfig(numWorkers, expiryThresholdDays int) error {
+// 	if numWorkers < 1 {
+// 		return fmt.Errorf("number of workers must be at least 1, got %d", numWorkers)
+// 	}
+
+// 	if numWorkers > 100 {
+// 		return fmt.Errorf("number of workers %d seems excessive (max recommended: 100)", numWorkers)
+// 	}
+
+// 	if expiryThresholdDays < 1 {
+// 		return fmt.Errorf("expiry threshold days must be at least 1, got %d", expiryThresholdDays)
+// 	}
+
+// 	if expiryThresholdDays > 365 {
+// 		return fmt.Errorf("expiry threshold days %d seems excessive (max recommended: 365)", expiryThresholdDays)
+// 	}
+
+// 	return nil
+// }
+
+// // validateTLSConfig validates TLS certificate configuration
+// func validateTLSConfig(tlsCertFile, tlsKeyFile string) error {
+// 	if tlsCertFile != "" || tlsKeyFile != "" {
+// 		if tlsCertFile == "" {
+// 			return fmt.Errorf("TLS certificate file must be specified when TLS key file is provided")
+// 		}
+// 		if tlsKeyFile == "" {
+// 			return fmt.Errorf("TLS key file must be specified when TLS certificate file is provided")
+// 		}
+
+// 		if err := validateFileAccess(tlsCertFile); err != nil {
+// 			return fmt.Errorf("TLS certificate file validation failed: %w", err)
+// 		}
+
+// 		if err := validateFileAccess(tlsKeyFile); err != nil {
+// 			return fmt.Errorf("TLS key file validation failed: %w", err)
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+// // validateFileConfig validates log and cache file configuration
+// func validateFileConfig(logFile, cacheFile string) error {
+// 	if logFile != "" {
+// 		if err := validateDirectoryCreation(filepath.Dir(logFile)); err != nil {
+// 			return fmt.Errorf("log file directory validation failed: %w", err)
+// 		}
+// 	}
+
+// 	if cacheFile != "" {
+// 		if err := validateDirectoryCreation(filepath.Dir(cacheFile)); err != nil {
+// 			return fmt.Errorf("cache file directory validation failed: %w", err)
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+// // Helper validation functions
+// func validateFileAccess(path string) error {
+// 	if _, err := os.Stat(path); err != nil {
+// 		if os.IsNotExist(err) {
+// 			return fmt.Errorf("file does not exist: %q", path)
+// 		}
+// 		return fmt.Errorf("cannot access file %q: %w", path, err)
+// 	}
+// 	return nil
+// }
+
+// func validateDirectoryAccess(dir string) error {
+// 	info, err := os.Stat(dir)
+// 	if err != nil {
+// 		if os.IsNotExist(err) {
+// 			return fmt.Errorf("directory does not exist: %q", dir)
+// 		}
+// 		return fmt.Errorf("cannot access directory %q: %w", dir, err)
+// 	}
+
+// 	if !info.IsDir() {
+// 		return fmt.Errorf("path is not a directory: %q", dir)
+// 	}
+
+// 	if _, err := os.ReadDir(dir); err != nil {
+// 		return fmt.Errorf("cannot read directory %q: %w", dir, err)
+// 	}
+
+// 	return nil
+// }
+
+// func validateDirectoryCreation(dir string) error {
+// 	if dir != "" && dir != "." {
+// 		if err := os.MkdirAll(dir, 0o755); err != nil {
+// 			return fmt.Errorf("cannot create directory %q: %w", dir, err)
+// 		}
+// 	}
+// 	return nil
+// }
+
 // Global State Management
 // ======================
 
 // getConfig safely retrieves the current configuration
-func (gs *GlobalState) getConfig() *config.Config {
+func (gs *GlobalState) getConfig() *Config {
 	gs.configMutex.RLock()
 	defer gs.configMutex.RUnlock()
 	return gs.config
 }
 
 // setConfig safely updates the global configuration
-func (gs *GlobalState) setConfig(cfg *config.Config) {
+func (gs *GlobalState) setConfig(cfg *Config) {
 	gs.configMutex.Lock()
 	defer gs.configMutex.Unlock()
 	gs.config = cfg
@@ -348,7 +622,7 @@ func (gs *GlobalState) saveCacheToFile(path string) error {
 	}
 
 	// Create directory if needed
-	if err := utils.ValidateDirectoryCreation(filepath.Dir(path)); err != nil {
+	if err := validateDirectoryCreation(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("cache directory creation failed: %w", err)
 	}
 
@@ -363,6 +637,25 @@ func (gs *GlobalState) saveCacheToFile(path string) error {
 	}).Debug("Certificate cache saved successfully")
 
 	return nil
+}
+
+// pruneCacheNonExistingUnsafe removes cache entries for files that no longer exist
+// This version assumes the caller already holds the certCacheLock
+func (gs *GlobalState) pruneCacheNonExistingUnsafe() int {
+	pruned := 0
+
+	for path := range gs.certCache {
+		if _, err := os.Stat(path); err != nil {
+			delete(gs.certCache, path)
+			pruned++
+		}
+	}
+
+	if pruned > 0 {
+		log.WithField("pruned_entries", pruned).Debug("Cache pruning completed (unsafe)")
+	}
+
+	return pruned
 }
 
 // pruneCacheNonExisting removes cache entries for files that no longer exist
@@ -415,7 +708,7 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 		}
 	}()
 
-	if err := utils.ValidateDirectoryAccess(dirPath); err != nil {
+	if err := validateDirectoryAccess(dirPath); err != nil {
 		logger.WithError(err).Warn("Directory validation failed, skipping scan")
 		registerScanFailure(dirPath)
 		return nil
@@ -456,7 +749,7 @@ func processCertificateFile(path string, d fs.DirEntry, walkErr error, dirPath s
 		return handleDirectory(d)
 	}
 
-	if !utils.IsCertificateFile(d.Name()) {
+	if !isCertificateFile(d.Name()) {
 		return nil
 	}
 
@@ -562,6 +855,12 @@ func handleDirectory(d fs.DirEntry) error {
 	return nil
 }
 
+// // isCertificateFile checks if a file is a certificate based on extension
+// func isCertificateFile(filename string) bool {
+// 	ext := strings.ToLower(filepath.Ext(filename))
+// 	return ext == ".pem" || ext == ".crt" || ext == ".cer" || ext == ".der"
+// }
+
 // parseCertificateFile parses a certificate file and returns the leaf certificate
 func parseCertificateFile(path, ext string) (*x509.Certificate, error) {
 	raw, err := os.ReadFile(path)
@@ -600,8 +899,8 @@ func parseCertificateFile(path, ext string) (*x509.Certificate, error) {
 // processCertificate processes a parsed certificate and updates metrics
 func (gs *GlobalState) processCertificate(cert *x509.Certificate, path, dirPath string, seen map[string]int, dryRun bool, info os.FileInfo) {
 	filename := filepath.Base(path)
-	sanitizedFilename := utils.SanitizeLabelValue(filename)
-	sanitizedCN := utils.SanitizeLabelValue(cert.Subject.CommonName)
+	sanitizedFilename := sanitizeLabelValue(filename)
+	sanitizedCN := sanitizeLabelValue(cert.Subject.CommonName)
 
 	// Track duplicates
 	fingerprint := sha256.Sum256(cert.Raw)
@@ -623,9 +922,9 @@ func (gs *GlobalState) processCertificate(cert *x509.Certificate, path, dirPath 
 		NotAfter:            cert.NotAfter,
 		SANs:                cert.DNSNames,
 		Type:                "leaf_certificate",
-		IssuerCode:          utils.DetermineIssuerCode(cert),
-		IsWeakKey:           utils.IsWeakKey(cert),
-		HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
+		IssuerCode:          determineIssuerCode(cert),
+		IsWeakKey:           isWeakKey(cert),
+		HasDeprecatedSigAlg: isDeprecatedSigAlg(cert.SignatureAlgorithm),
 	}
 
 	// Additional validation logging for debugging metric consistency
@@ -707,12 +1006,29 @@ func prepareSANsForMetrics(sans []string) string {
 	}
 
 	limitedSANs := sans
-	if len(limitedSANs) > utils.MaxSANsExported {
-		limitedSANs = limitedSANs[:utils.MaxSANsExported]
+	if len(limitedSANs) > maxSANsExported {
+		limitedSANs = limitedSANs[:maxSANsExported]
 	}
 
-	return utils.SanitizeLabelValue(strings.Join(limitedSANs, ","))
+	return sanitizeLabelValue(strings.Join(limitedSANs, ","))
 }
+
+// // determineIssuerCode determines the issuer code for certificate classification
+// func determineIssuerCode(cert *x509.Certificate) int {
+// 	if strings.EqualFold(cert.Subject.CommonName, cert.Issuer.CommonName) {
+// 		return IssuerCodeSelfSigned
+// 	}
+
+// 	issuerLower := strings.ToLower(cert.Issuer.CommonName)
+// 	switch {
+// 	case strings.Contains(issuerLower, "digicert"):
+// 		return IssuerCodeDigiCert
+// 	case strings.Contains(issuerLower, "amazon"):
+// 		return IssuerCodeAmazon
+// 	default:
+// 		return IssuerCodeOther
+// 	}
+// }
 
 // Scan Backoff Management
 // ======================
@@ -728,8 +1044,8 @@ func registerScanFailure(dir string) {
 	// Apply exponential backoff if already in backoff
 	if lastBackoff, exists := globalState.scanBackoff[dir]; exists && lastBackoff.After(now) {
 		delay = lastBackoff.Sub(now) * 2
-		if delay < 0 || delay > utils.MaxBackoff {
-			delay = utils.MaxBackoff
+		if delay < 0 || delay > maxBackoff {
+			delay = maxBackoff
 		}
 	}
 
@@ -796,6 +1112,44 @@ func clearExpiredBackoffs() {
 
 // Utility Functions
 // ================
+
+// // sanitizeLabelValue sanitizes a string for use as a Prometheus label value
+// func sanitizeLabelValue(val string) string {
+// 	val = strings.TrimSpace(val)
+// 	if len(val) > maxLabelLength {
+// 		return val[:maxLabelLength]
+// 	}
+// 	return val
+// }
+
+// // isWeakKey determines if a certificate has a weak cryptographic key
+// func isWeakKey(cert *x509.Certificate) bool {
+// 	switch pub := cert.PublicKey.(type) {
+// 	case *rsa.PublicKey:
+// 		return pub.N.BitLen() < 2048
+// 	case *ecdsa.PublicKey:
+// 		return pub.Curve.Params().BitSize < 256
+// 	default:
+// 		return false
+// 	}
+// }
+
+// // isDeprecatedSigAlg checks if a signature algorithm is deprecated
+// func isDeprecatedSigAlg(alg x509.SignatureAlgorithm) bool {
+// 	deprecatedAlgorithms := []x509.SignatureAlgorithm{
+// 		x509.SHA1WithRSA,
+// 		x509.DSAWithSHA1,
+// 		x509.ECDSAWithSHA1,
+// 		x509.MD5WithRSA,
+// 	}
+
+// 	for _, deprecated := range deprecatedAlgorithms {
+// 		if alg == deprecated {
+// 			return true
+// 		}
+// 	}
+// 	return false
+// }
 
 // shouldWriteMetrics determines if metrics should be written
 func shouldWriteMetrics() bool {
@@ -872,7 +1226,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Disk space checks
 	for _, dir := range cfg.CertDirs {
-		checkKey := "disk_space_" + utils.SanitizeLabelValue(dir)
+		checkKey := "disk_space_" + sanitizeLabelValue(dir)
 		if err := checkDiskSpace(dir); err != nil {
 			checks[checkKey] = err.Error()
 			isHealthy = false
@@ -1159,7 +1513,7 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // collectCertificateInfo collects certificate information for the API
-func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
+func collectCertificateInfo(cfg *Config) []CertificateInfo {
 	var certificates []CertificateInfo
 
 	globalState.certCacheLock.RLock()
@@ -1186,9 +1540,9 @@ func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
 				SANs:                cert.DNSNames,
 				ExpiringSoon:        time.Until(cert.NotAfter) <= expiryThreshold,
 				Type:                "leaf_certificate",
-				IssuerCode:          utils.DetermineIssuerCode(cert),
-				IsWeakKey:           utils.IsWeakKey(cert),
-				HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
+				IssuerCode:          determineIssuerCode(cert),
+				IsWeakKey:           isWeakKey(cert),
+				HasDeprecatedSigAlg: isDeprecatedSigAlg(cert.SignatureAlgorithm),
 			}
 			certificates = append(certificates, certInfo)
 		}
@@ -1230,9 +1584,9 @@ func checkDiskSpace(dir string) error {
 	}
 
 	availableBytes := stat.Bavail * uint64(stat.Bsize)
-	if availableBytes < utils.MinDiskSpaceBytes {
+	if availableBytes < minDiskSpaceBytes {
 		return fmt.Errorf("insufficient disk space: %d bytes available (minimum: %d)",
-			availableBytes, utils.MinDiskSpaceBytes)
+			availableBytes, minDiskSpaceBytes)
 	}
 
 	return nil
@@ -1283,6 +1637,21 @@ func checkCacheFileWritable(cacheFile string) error {
 	return nil
 }
 
+// findLabel safely retrieves a label value from a Prometheus metric
+func findLabel(m *dto.Metric, key string) string {
+	if m == nil || m.Label == nil {
+		return ""
+	}
+
+	for _, label := range m.GetLabel() {
+		if label != nil && label.GetName() == key {
+			return label.GetValue()
+		}
+	}
+
+	return ""
+}
+
 // Logging and Initialization
 // ==========================
 
@@ -1321,7 +1690,7 @@ func initLogger(logPath string, dryRun bool) {
 // ==============================
 
 // setupFileSystemWatcher configures directory watching for certificate changes
-func setupFileSystemWatcher(ctx context.Context, cfg *config.Config) (*fsnotify.Watcher, error) {
+func setupFileSystemWatcher(ctx context.Context, cfg *Config) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file system watcher: %w", err)
@@ -1433,6 +1802,31 @@ func removeDirectoryFromWatcher(watcher *fsnotify.Watcher, dirPath string) {
 // Configuration Reload Management
 // ===============================
 
+// ConfigReloadResult represents the result of a configuration reload attempt
+type ConfigReloadResult struct {
+	Success         bool              `json:"success"`
+	Error           string            `json:"error,omitempty"`
+	ChangedSettings map[string]string `json:"changed_settings,omitempty"`
+	RequiresRestart []string          `json:"requires_restart,omitempty"`
+	AppliedChanges  []string          `json:"applied_changes,omitempty"`
+}
+
+// ConfigDiff represents differences between old and new configuration
+type ConfigDiff struct {
+	CertDirsChanged          bool
+	LogFileChanged           bool
+	PortChanged              bool
+	BindAddressChanged       bool
+	NumWorkersChanged        bool
+	TLSConfigChanged         bool
+	RuntimeMetricsChanged    bool
+	WeakCryptoMetricsChanged bool
+	PprofChanged             bool
+	CacheFileChanged         bool
+	ExpiryThresholdChanged   bool
+	ClearCacheChanged        bool
+}
+
 // reloadConfigAndTrigger reloads configuration and triggers certificate rescan
 func reloadConfigAndTrigger() {
 	if globalState.configFilePath == "" {
@@ -1459,8 +1853,8 @@ func reloadConfigAndTrigger() {
 }
 
 // performHotConfigReload performs hot configuration reload with change detection
-func performHotConfigReload(configPath string) config.ReloadResult {
-	result := config.ReloadResult{
+func performHotConfigReload(configPath string) ConfigReloadResult {
+	result := ConfigReloadResult{
 		ChangedSettings: make(map[string]string),
 		AppliedChanges:  make([]string, 0),
 		RequiresRestart: make([]string, 0),
@@ -1474,8 +1868,8 @@ func performHotConfigReload(configPath string) config.ReloadResult {
 	}
 
 	// Load new configuration
-	newConfig := config.Default()
-	if err := loadConfigFromFile(configPath); err != nil {
+	newConfig := DefaultConfig()
+	if err := loadConfigFromFile(configPath, newConfig); err != nil {
 		result.Error = fmt.Sprintf("failed to load new configuration: %v", err)
 		return result
 	}
@@ -1496,9 +1890,27 @@ func performHotConfigReload(configPath string) config.ReloadResult {
 	return result
 }
 
+// loadConfigFromFile loads configuration from file into provided config struct
+func loadConfigFromFile(path string, cfg *Config) error {
+	if err := validateFileAccess(path); err != nil {
+		return fmt.Errorf("config file validation failed: %w", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return validateConfig(cfg)
+}
+
 // detectConfigChanges compares old and new configurations to detect differences
-func detectConfigChanges(oldCfg, newCfg *config.Config) config.Diff {
-	return config.Diff{
+func detectConfigChanges(oldCfg, newCfg *Config) ConfigDiff {
+	return ConfigDiff{
 		CertDirsChanged:          !equalStringSlices(oldCfg.CertDirs, newCfg.CertDirs),
 		LogFileChanged:           oldCfg.LogFile != newCfg.LogFile,
 		PortChanged:              oldCfg.Port != newCfg.Port,
@@ -1515,7 +1927,7 @@ func detectConfigChanges(oldCfg, newCfg *config.Config) config.Diff {
 }
 
 // applyHotReloadableChanges applies configuration changes that don't require restart
-func applyHotReloadableChanges(oldCfg, newCfg *config.Config, diff config.Diff, result *config.ReloadResult) {
+func applyHotReloadableChanges(oldCfg, newCfg *Config, diff ConfigDiff, result *ConfigReloadResult) {
 	// Certificate directories - can be hot-reloaded
 	if diff.CertDirsChanged {
 		result.ChangedSettings["cert_dirs"] = fmt.Sprintf("%d -> %d directories", len(oldCfg.CertDirs), len(newCfg.CertDirs))
@@ -1575,7 +1987,7 @@ func applyHotReloadableChanges(oldCfg, newCfg *config.Config, diff config.Diff, 
 }
 
 // identifyRestartRequiredChanges identifies changes that require application restart
-func identifyRestartRequiredChanges(diff config.Diff, result *config.ReloadResult) {
+func identifyRestartRequiredChanges(diff ConfigDiff, result *ConfigReloadResult) {
 	// Network configuration changes require restart
 	if diff.PortChanged {
 		result.RequiresRestart = append(result.RequiresRestart, "http_port")
@@ -1856,7 +2268,7 @@ func processCertificateReload(ctx context.Context) {
 }
 
 // processDirectoriesWithWorkers processes certificate directories using a worker pool
-func processDirectoriesWithWorkers(ctx context.Context, cfg *config.Config) {
+func processDirectoriesWithWorkers(ctx context.Context, cfg *Config) {
 	dirJobs := make(chan string, len(cfg.CertDirs))
 	var wg sync.WaitGroup
 
@@ -1998,7 +2410,7 @@ func runRuntimeMetricsCollector(ctx context.Context) {
 
 	defer log.Info("Runtime metrics collector shutting down")
 
-	ticker := time.NewTicker(utils.RuntimeMetricsInterval)
+	ticker := time.NewTicker(runtimeMetricsInterval)
 	defer ticker.Stop()
 
 	var memStats runtime.MemStats
@@ -2054,7 +2466,7 @@ func handleFileSystemEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
 	// Handle directory removal
 	if event.Op&fsnotify.Remove != 0 {
 		// Immediately remove from cache if it's a certificate file
-		if utils.IsCertificateFile(filepath.Base(event.Name)) {
+		if isCertificateFile(filepath.Base(event.Name)) {
 			globalState.certCacheLock.Lock()
 			if _, exists := globalState.certCache[event.Name]; exists {
 				delete(globalState.certCache, event.Name)
@@ -2148,7 +2560,7 @@ func runConfigWatcher(ctx context.Context, configWatcher *fsnotify.Watcher) {
 					}
 				}
 
-				debounceTimer = time.AfterFunc(utils.WatcherDebounce, func() {
+				debounceTimer = time.AfterFunc(watcherDebounce, func() {
 					log.Info("Debounced configuration reload triggered")
 					reloadConfigAndTrigger()
 				})
@@ -2167,7 +2579,7 @@ func runConfigWatcher(ctx context.Context, configWatcher *fsnotify.Watcher) {
 // =====================
 
 // startHTTPServer starts the metrics and API server
-func startHTTPServer(ctx context.Context, cfg *config.Config) *http.Server {
+func startHTTPServer(ctx context.Context, cfg *Config) *http.Server {
 	// Setup HTTP routes
 	setupHTTPRoutes(cfg)
 
@@ -2202,7 +2614,7 @@ func startHTTPServer(ctx context.Context, cfg *config.Config) *http.Server {
 }
 
 // setupHTTPRoutes configures HTTP endpoints
-func setupHTTPRoutes(cfg *config.Config) {
+func setupHTTPRoutes(cfg *Config) {
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/healthz", healthHandler)
 	http.HandleFunc("/certs", certsHandler)
@@ -2218,7 +2630,7 @@ func setupHTTPRoutes(cfg *config.Config) {
 
 // shutdownHTTPServer gracefully shuts down the HTTP server
 func shutdownHTTPServer(server *http.Server) {
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), utils.GracefulShutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 	defer cancel()
 
 	log.Info("Shutting down HTTP server gracefully")
@@ -2228,6 +2640,23 @@ func shutdownHTTPServer(server *http.Server) {
 		log.Info("HTTP server shut down successfully")
 	}
 }
+
+// Utility Functions for Main
+// ==========================
+
+// // defaultLogPath returns the default log file path based on OS
+// func defaultLogPath() string {
+// 	if isWindows() {
+// 		return "C:\\Logs\\cert-monitor.log"
+// 	}
+// 	return "/var/log/cert-monitor.log"
+// }
+
+// // isWindows detects if running on Windows
+// func isWindows() bool {
+// 	return strings.Contains(strings.ToLower(os.Getenv("OS")), "windows") ||
+// 		os.PathSeparator == '\\'
+// }
 
 // Command Line Interface
 // =====================
@@ -2245,7 +2674,7 @@ func (a *arrayFlags) Set(value string) error {
 }
 
 // parseCommandLineFlags parses and applies command line flags
-func parseCommandLineFlags() *config.Config {
+func parseCommandLineFlags() *Config {
 	var (
 		certDirs    arrayFlags
 		logFile     string
@@ -2270,7 +2699,7 @@ func parseCommandLineFlags() *config.Config {
 	flag.IntVar(&numWorkers, "workers", 0, "Number of workers")
 	flag.StringVar(&configFile, "config", "", "YAML configuration file path")
 	flag.BoolVar(&dryRun, "dry-run", false, "Run once and log only (no metrics)")
-	flag.IntVar(&expiryDays, "expiry-threshold-days", utils.DefaultExpiryDays, "Days to consider certificate expiring soon")
+	flag.IntVar(&expiryDays, "expiry-threshold-days", defaultExpiryDays, "Days to consider certificate expiring soon")
 	flag.BoolVar(&clearCache, "clear-cache-on-reload", false, "Clear certificate cache on reload")
 	flag.StringVar(&tlsCert, "tls-cert-file", "", "TLS certificate file for HTTPS server")
 	flag.StringVar(&tlsKey, "tls-key-file", "", "TLS key file for HTTPS server")
@@ -2288,14 +2717,14 @@ func parseCommandLineFlags() *config.Config {
 	}
 
 	// Load configuration from file
-	if err := loadConfigFromFile(configFile); err != nil {
+	if err := LoadConfig(configFile); err != nil {
 		log.WithError(err).Fatal("Failed to load configuration")
 	}
 
 	// Apply command line overrides
 	cfg := globalState.getConfig()
 	if cfg == nil {
-		cfg = config.Default()
+		cfg = DefaultConfig()
 		globalState.setConfig(cfg)
 	}
 
@@ -2310,11 +2739,11 @@ func parseCommandLineFlags() *config.Config {
 func handleConfigValidation(configFile string) {
 	log.Info("Running configuration validation mode")
 
-	if err := loadConfigFromFile(configFile); err != nil {
+	if err := LoadConfig(configFile); err != nil {
 		log.WithError(err).Fatal("Configuration validation failed")
 	}
 
-	if err := config.Validate(globalState.getConfig()); err != nil {
+	if err := validateConfig(globalState.getConfig()); err != nil {
 		log.WithError(err).Fatal("Configuration validation failed")
 	}
 
@@ -2323,7 +2752,7 @@ func handleConfigValidation(configFile string) {
 }
 
 // applyCommandLineOverrides applies command line flag overrides to configuration
-func applyCommandLineOverrides(cfg *config.Config, certDirs *arrayFlags, logFile, port, bindAddr string,
+func applyCommandLineOverrides(cfg *Config, certDirs *arrayFlags, logFile, port, bindAddr string,
 	numWorkers int, dryRun bool, expiryDays int, clearCache bool, tlsCert, tlsKey string, enablePprof bool) {
 
 	if len(*certDirs) > 0 {
@@ -2362,7 +2791,7 @@ func applyCommandLineOverrides(cfg *config.Config, certDirs *arrayFlags, logFile
 }
 
 // applyEnvironmentOverrides applies environment variable overrides to configuration
-func applyEnvironmentOverrides(cfg *config.Config) {
+func applyEnvironmentOverrides(cfg *Config) {
 	envOverrides := map[string]func(string){
 		"CERT_DIRS": func(v string) {
 			if v != "" {
@@ -2439,7 +2868,7 @@ func applyEnvironmentOverrides(cfg *config.Config) {
 }
 
 // performDryRun executes a dry run scan and exits
-func performDryRun(cfg *config.Config) {
+func performDryRun(cfg *Config) {
 	log.Info("Starting dry-run mode - processing leaf certificates only")
 
 	for _, dir := range cfg.CertDirs {
@@ -2615,23 +3044,4 @@ func performGracefulShutdown(server *http.Server, watcher *fsnotify.Watcher) {
 	} else {
 		log.Info("Certificate cache saved successfully during shutdown")
 	}
-}
-
-// loadConfigFromFile loads configuration from file using new config package
-func loadConfigFromFile(configFile string) error {
-	cfg, err := config.Load(configFile)
-	if err != nil {
-		return err
-	}
-
-	globalState.setConfig(cfg)
-
-	log.WithFields(log.Fields{
-		"config_file": configFile,
-		"cert_dirs":   len(cfg.CertDirs),
-		"port":        cfg.Port,
-		"workers":     cfg.NumWorkers,
-	}).Info("Configuration loaded successfully")
-
-	return nil
 }
