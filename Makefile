@@ -35,7 +35,7 @@ build-static:
 	CGO_ENABLED=0 GOOS=linux $(GOBUILD) $(LDFLAGS) -a -installsuffix cgo -o $(BINARY_NAME)-static .
 
 # Multi-platform builds
-build-all: build-linux build-windows build-darwin
+build-all: build-linux build-darwin #build-windows
 
 build-linux:
 	@echo "Building for Linux..."
