@@ -149,7 +149,7 @@ func (c *DefaultCollector) register() {
 }
 
 // UpdateCertificate updates metrics for a single certificate
-func (c *DefaultCollector) UpdateCertificate(certMetrics CertificateMetrics) {
+func (c *DefaultCollector) UpdateCertificate(certMetrics *CertificateMetrics) {
 	// Basic certificate metrics
 	c.CertExpiration.WithLabelValues(certMetrics.CommonName, certMetrics.FileName).Set(certMetrics.ExpirationTimestamp)
 	c.CertSANCount.WithLabelValues(certMetrics.CommonName, certMetrics.FileName).Set(certMetrics.SANCount)
@@ -182,7 +182,7 @@ func (c *DefaultCollector) UpdateCertificate(certMetrics CertificateMetrics) {
 }
 
 // UpdateDirectory updates metrics for directory processing
-func (c *DefaultCollector) UpdateDirectory(dirMetrics DirectoryMetrics) {
+func (c *DefaultCollector) UpdateDirectory(dirMetrics *DirectoryMetrics) {
 	c.CertFilesTotal.WithLabelValues(dirMetrics.Directory).Add(dirMetrics.FilesTotal)
 	c.CertsParsedTotal.WithLabelValues(dirMetrics.Directory).Add(dirMetrics.CertsParsed)
 	c.CertScanDuration.WithLabelValues(dirMetrics.Directory).Observe(dirMetrics.ScanDuration)
@@ -254,8 +254,8 @@ func (c *DefaultCollector) ResetCounters() {
 }
 
 // CreateCertificateMetrics converts certificate info to metrics format
-func CreateCertificateMetrics(certInfo *certificate.Info, duplicateCount int) CertificateMetrics {
-	return CertificateMetrics{
+func CreateCertificateMetrics(certInfo *certificate.Info, duplicateCount int) *CertificateMetrics {
+	return &CertificateMetrics{
 		CommonName:          certInfo.CommonName,
 		FileName:            certInfo.FileName,
 		ExpirationTimestamp: float64(certInfo.NotAfter.Unix()),
@@ -269,8 +269,8 @@ func CreateCertificateMetrics(certInfo *certificate.Info, duplicateCount int) Ce
 }
 
 // CreateDirectoryMetrics creates directory metrics from processing stats
-func CreateDirectoryMetrics(directory string, stats *certificate.DirectoryStats) DirectoryMetrics {
-	return DirectoryMetrics{
+func CreateDirectoryMetrics(directory string, stats *certificate.DirectoryStats) *DirectoryMetrics {
+	return &DirectoryMetrics{
 		Directory:    directory,
 		FilesTotal:   float64(stats.FilesProcessed),
 		CertsParsed:  float64(stats.CertsParsed),

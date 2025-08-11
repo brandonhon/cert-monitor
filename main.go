@@ -326,7 +326,7 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 		collector := metricsRegistry.GetCollector()
 
 		// Update directory metrics
-		dirMetrics := metrics.CreateDirectoryMetrics(dirPath, stats)
+		dirMetrics := metrics.CreateDirectoryMetrics(dirPath, stats) // Already returns pointer now
 		collector.UpdateDirectory(dirMetrics)
 	}
 
@@ -383,7 +383,7 @@ func processIndividualCertificatesForMetrics(processor certificate.Processor, di
 		duplicateCount := duplicates[fingerprint]
 
 		// Update individual certificate metrics
-		certMetrics := metrics.CreateCertificateMetrics(result.Info, duplicateCount)
+		certMetrics := metrics.CreateCertificateMetrics(result.Info, duplicateCount) // Already returns pointer now
 		collector.UpdateCertificate(certMetrics)
 
 		log.WithFields(log.Fields{
