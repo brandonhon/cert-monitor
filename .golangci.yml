@@ -1,0 +1,96 @@
+run:
+  timeout: 5m
+  go: "1.21"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - typecheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - gocritic
+    - gosec
+    - revive
+    - gocyclo
+  disable:
+    # Add any problematic linters here if needed
+    # - deadcode  # deprecated
+    # - varcheck  # deprecated
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/brandonhon/cert-monitor
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - experimental
+      - opinionated
+      - performance
+      - style
+    disabled-checks:
+      - unnamedResult  # Allow unnamed results for simple functions
+
+  gosec:
+    excludes:
+      - G108  # Profiling endpoint automatically exposed - this is intentional
+      - G306  # Poor file permissions - 0644 is acceptable for non-sensitive files
+      - G404  # Weak random number generator - using for non-cryptographic purposes
+      - G115  # Integer overflow conversion - false positive in this context
+      - G204  # Subprocess launched with variable
+      - G301  # Poor file permissions used when creating a directory
+      - G302  # Poor file permissions used with chmod
+      - G304  # File path provided as taint input
+
+  revive:
+    confidence: 0.8
+
+issues:
+  exclude-rules:
+    # Exclude some linters from running on tests files
+    - path: _test\.go
+      linters:
+        - gosec
+        - gocritic
+    
+    # Exclude unused function warnings from main.go during migration
+    - path: main\.go
+      linters:
+        - unused
+      text: "is unused"
+
+    # Exclude goimports from running on main.go
+    - path: main\.go
+      linters:
+        - goimports
+      text: "properly formatted"
+
+    # Exclude goimports from running on internal/config/config.go
+    - path: internal/config/config\.go
+      linters:
+        - goimports
+      text: "properly formatted"
+
+    # Exclude goimports from running on internal/metrics/collector.go
+    - path: internal/metrics/collector\.go
+      linters:
+        - goimports
+      text: "properly formatted"
+
+  # Maximum issues count per one linter
+  max-issues-per-linter: 0
+
+  # Maximum count of issues with the same text
+  max-same-issues: 0
+
+output:
+  formats:
+    - format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true

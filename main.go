@@ -12,9 +12,8 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,18 +24,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/brandonhon/cert-monitor/internal/cache"
+	"github.com/brandonhon/cert-monitor/internal/certificate"
 	"github.com/brandonhon/cert-monitor/internal/config"
+	"github.com/brandonhon/cert-monitor/internal/metrics"
 	"github.com/brandonhon/cert-monitor/pkg/utils"
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -64,53 +64,6 @@ type GlobalState struct {
 	watchedDirs     map[string]bool
 	watchedDirsLock sync.Mutex
 	mainWatcher     *fsnotify.Watcher
-
-	// Certificate cache
-	certCache     map[string]CachedCertMeta
-	certCacheLock sync.RWMutex
-	cacheFilePath string
-	cacheHits     int64
-	cacheMisses   int64
-}
-
-// CachedCertMeta holds metadata for cached certificates
-type CachedCertMeta struct {
-	Fingerprint [32]byte  `json:"fingerprint"`
-	ModTime     time.Time `json:"mod_time"`
-	Size        int64     `json:"size"`
-}
-
-// MetricsCollector encapsulates all Prometheus metrics
-type MetricsCollector struct {
-	CertExpiration          *prometheus.GaugeVec
-	CertSANCount            *prometheus.GaugeVec
-	CertInfo                *prometheus.GaugeVec
-	CertDuplicateCount      *prometheus.GaugeVec
-	CertParseErrors         *prometheus.CounterVec
-	CertFilesTotal          *prometheus.CounterVec
-	CertsParsedTotal        *prometheus.CounterVec
-	CertLastScan            *prometheus.GaugeVec
-	LastReload              prometheus.Gauge
-	CertScanDuration        *prometheus.HistogramVec
-	HeapAllocGauge          prometheus.Gauge
-	WeakKeyCounter          *prometheus.CounterVec
-	DeprecatedSigAlgCounter *prometheus.CounterVec
-	CertIssuerCode          *prometheus.GaugeVec
-}
-
-// CertificateInfo represents parsed certificate data
-type CertificateInfo struct {
-	CommonName          string    `json:"common_name"`
-	FileName            string    `json:"file_name"`
-	Issuer              string    `json:"issuer"`
-	NotBefore           time.Time `json:"not_before"`
-	NotAfter            time.Time `json:"not_after"`
-	SANs                []string  `json:"sans,omitempty"`
-	ExpiringSoon        bool      `json:"expiring_soon"`
-	Type                string    `json:"type"`
-	IssuerCode          int       `json:"issuer_code"`
-	IsWeakKey           bool      `json:"is_weak_key"`
-	HasDeprecatedSigAlg bool      `json:"has_deprecated_sig_alg"`
 }
 
 // HealthResponse represents the health check response
@@ -129,115 +82,16 @@ type CacheStats struct {
 
 // Global instances
 var (
-	globalState *GlobalState
-	metrics     *MetricsCollector
+	globalState     *GlobalState
+	cacheManager    cache.Manager
+	metricsRegistry *metrics.Registry
 )
 
 func init() {
 	globalState = &GlobalState{
 		scanBackoff: make(map[string]time.Time),
 		watchedDirs: make(map[string]bool),
-		certCache:   make(map[string]CachedCertMeta),
 	}
-
-	metrics = initMetrics()
-	registerMetrics()
-}
-
-// initMetrics creates and initializes all Prometheus metrics
-func initMetrics() *MetricsCollector {
-	return &MetricsCollector{
-		CertExpiration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_expiration_timestamp",
-			Help: "Expiration time of SSL cert (Unix timestamp)",
-		}, []string{"common_name", "filename"}),
-
-		CertSANCount: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_san_count",
-			Help: "Number of SAN entries in cert",
-		}, []string{"common_name", "filename"}),
-
-		CertInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_info",
-			Help: "Static info for cert including CN and SANs",
-		}, []string{"common_name", "filename", "sans"}),
-
-		CertDuplicateCount: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_duplicate_count",
-			Help: "Number of times a cert appears",
-		}, []string{"common_name", "filename"}),
-
-		CertParseErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_parse_errors_total",
-			Help: "Number of cert parse errors",
-		}, []string{"filename"}),
-
-		CertFilesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_files_total",
-			Help: "Total number of certificate files processed",
-		}, []string{"dir"}),
-
-		CertsParsedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_certs_parsed_total",
-			Help: "Total number of individual certificates successfully parsed",
-		}, []string{"dir"}),
-
-		CertLastScan: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_last_scan_timestamp",
-			Help: "Unix timestamp of the last successful scan of a certificate directory",
-		}, []string{"dir"}),
-
-		LastReload: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "ssl_cert_last_reload_timestamp",
-			Help: "Unix timestamp of the last successful configuration reload",
-		}),
-
-		CertScanDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "ssl_cert_scan_duration_seconds",
-			Help:    "Duration of certificate directory scans in seconds",
-			Buckets: prometheus.DefBuckets,
-		}, []string{"dir"}),
-
-		HeapAllocGauge: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "ssl_monitor_heap_alloc_bytes",
-			Help: "Heap memory allocated (bytes) as reported by runtime.ReadMemStats",
-		}),
-
-		WeakKeyCounter: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_weak_key_total",
-			Help: "Total number of certificates detected with weak keys (e.g., RSA < 2048 bits)",
-		}, []string{"common_name", "filename"}),
-
-		DeprecatedSigAlgCounter: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_deprecated_sigalg_total",
-			Help: "Total number of certificates with deprecated signature algorithms (e.g., SHA1, MD5)",
-		}, []string{"common_name", "filename"}),
-
-		CertIssuerCode: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_issuer_code",
-			Help: "Numeric code based on certificate issuer (30=digicert, 31=amazon, 32=other, 33=self-signed)",
-		}, []string{"common_name", "filename"}),
-	}
-}
-
-// registerMetrics registers all metrics with Prometheus
-func registerMetrics() {
-	prometheus.MustRegister(
-		metrics.CertExpiration,
-		metrics.CertSANCount,
-		metrics.CertInfo,
-		metrics.CertDuplicateCount,
-		metrics.CertParseErrors,
-		metrics.CertFilesTotal,
-		metrics.CertsParsedTotal,
-		metrics.CertLastScan,
-		metrics.LastReload,
-		metrics.CertScanDuration,
-		metrics.HeapAllocGauge,
-		metrics.WeakKeyCounter,
-		metrics.DeprecatedSigAlgCounter,
-		metrics.CertIssuerCode,
-	)
 }
 
 // Global State Management
@@ -255,141 +109,6 @@ func (gs *GlobalState) setConfig(cfg *config.Config) {
 	gs.configMutex.Lock()
 	defer gs.configMutex.Unlock()
 	gs.config = cfg
-}
-
-// Cache Management
-// ===============
-
-// getCacheEntryAtomic safely retrieves a cache entry and file stat
-func (gs *GlobalState) getCacheEntryAtomic(path string) (CachedCertMeta, os.FileInfo, bool, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return CachedCertMeta{}, nil, false, err
-	}
-
-	gs.certCacheLock.RLock()
-	cached, found := gs.certCache[path]
-	gs.certCacheLock.RUnlock()
-
-	return cached, info, found, nil
-}
-
-// setCacheEntryAtomic safely updates a cache entry
-func (gs *GlobalState) setCacheEntryAtomic(path string, fingerprint [32]byte, info os.FileInfo) {
-	gs.certCacheLock.Lock()
-	defer gs.certCacheLock.Unlock()
-
-	// Validate that the file still exists before caching
-	if _, err := os.Stat(path); err != nil {
-		log.WithFields(log.Fields{
-			"path":  path,
-			"error": err,
-		}).Debug("Skipping cache update for non-existent file")
-		return
-	}
-
-	gs.certCache[path] = CachedCertMeta{
-		Fingerprint: fingerprint,
-		ModTime:     info.ModTime(),
-		Size:        info.Size(),
-	}
-}
-
-// loadCacheFromFile loads certificate cache from disk
-func (gs *GlobalState) loadCacheFromFile(path string) error {
-	if path == "" {
-		log.Debug("No cache file path specified, skipping cache load")
-		return nil
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.WithError(err).WithField("cache_file", path).Info("No existing cache file or read error")
-		return nil
-	}
-
-	gs.certCacheLock.Lock()
-	defer gs.certCacheLock.Unlock()
-
-	if err := json.Unmarshal(data, &gs.certCache); err != nil {
-		log.WithError(err).WithField("cache_file", path).Warn("Failed to parse cache file, resetting cache")
-		gs.certCache = make(map[string]CachedCertMeta)
-		return err
-	}
-
-	log.WithFields(log.Fields{
-		"cache_file": path,
-		"entries":    len(gs.certCache),
-	}).Info("Certificate cache loaded successfully")
-
-	return nil
-}
-
-// saveCacheToFile saves certificate cache to disk
-func (gs *GlobalState) saveCacheToFile(path string) error {
-	if path == "" {
-		log.Debug("No cache file path specified, skipping cache save")
-		return nil
-	}
-
-	gs.certCacheLock.RLock()
-	cacheSize := len(gs.certCache)
-	// Create copy to avoid holding lock during I/O
-	cacheCopy := make(map[string]CachedCertMeta, cacheSize)
-	for k, v := range gs.certCache {
-		cacheCopy[k] = v
-	}
-	gs.certCacheLock.RUnlock()
-
-	data, err := json.MarshalIndent(cacheCopy, "", "  ")
-	if err != nil {
-		log.WithError(err).WithField("cache_file", path).Warn("Failed to marshal cache")
-		return err
-	}
-
-	// Create directory if needed
-	if err := utils.ValidateDirectoryCreation(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("cache directory creation failed: %w", err)
-	}
-
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		log.WithError(err).WithField("cache_file", path).Warn("Failed to write cache file")
-		return err
-	}
-
-	log.WithFields(log.Fields{
-		"cache_file": path,
-		"entries":    cacheSize,
-	}).Debug("Certificate cache saved successfully")
-
-	return nil
-}
-
-// pruneCacheNonExisting removes cache entries for files that no longer exist
-func (gs *GlobalState) pruneCacheNonExisting() int {
-	start := time.Now()
-	pruned := 0
-
-	gs.certCacheLock.Lock()
-	defer gs.certCacheLock.Unlock()
-
-	for path := range gs.certCache {
-		if _, err := os.Stat(path); err != nil {
-			delete(gs.certCache, path)
-			pruned++
-		}
-	}
-
-	if pruned > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries": pruned,
-			"duration":        time.Since(start),
-		}).Info("Pruned stale cache entries")
-	} else {
-		log.Debug("No stale cache entries found to prune")
-	}
-
-	return pruned
 }
 
 // Certificate Processing
@@ -411,7 +130,8 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 	start := time.Now()
 	defer func() {
 		if !dryRun && shouldWriteMetrics() {
-			metrics.CertScanDuration.WithLabelValues(dirPath).Observe(time.Since(start).Seconds())
+			collector := metricsRegistry.GetCollector()
+			collector.CertScanDuration.WithLabelValues(dirPath).Observe(time.Since(start).Seconds())
 		}
 	}()
 
@@ -423,15 +143,53 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 
 	defer func() {
 		if !dryRun && shouldWriteMetrics() {
-			metrics.CertLastScan.WithLabelValues(dirPath).Set(float64(time.Now().Unix()))
+			collector := metricsRegistry.GetCollector()
+			collector.CertLastScan.WithLabelValues(dirPath).Set(float64(time.Now().Unix()))
 		}
 	}()
 
+	// Create certificate processor
+	processor := certificate.NewProcessor()
+
+	// Create processing options
+	options := certificate.ProcessingOptions{
+		ExpiryThresholdDays: globalState.getConfig().ExpiryThresholdDays,
+		DryRun:              dryRun,
+		EnableWeakCrypto:    globalState.getConfig().EnableWeakCryptoMetrics,
+	}
+
 	// Process certificates and track duplicates
+	stats, duplicates, err := processor.ProcessDirectory(dirPath, options)
+	if err != nil {
+		logger.WithError(err).Warn("Certificate directory processing failed")
+		registerScanFailure(dirPath)
+		return nil
+	}
+
+	// Process individual certificates for metrics if we have results
+	if !dryRun && shouldWriteMetrics() {
+		processIndividualCertificatesForMetrics(processor, dirPath, options, duplicates)
+	}
+
+	// Update metrics based on processing results
+	if !dryRun && shouldWriteMetrics() {
+		collector := metricsRegistry.GetCollector()
+
+		// Update directory metrics
+		dirMetrics := metrics.CreateDirectoryMetrics(dirPath, stats) // Already returns pointer now
+		collector.UpdateDirectory(dirMetrics)
+	}
+
+	// Process individual certificates for metrics if we have results
+	if !dryRun && shouldWriteMetrics() {
+		processIndividualCertificatesForMetrics(processor, dirPath, options, duplicates)
+	}
+
+	// Convert DuplicateMap to map[string]int for return compatibility
 	seen := make(map[string]int)
-	err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
-		return processCertificateFile(path, d, err, dirPath, seen, dryRun)
-	})
+	for fingerprint, count := range duplicates {
+		seen[fingerprint] = count
+	}
 
 	if err != nil {
 		logger.WithError(err).Warn("Directory walk failed")
@@ -446,272 +204,45 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 	return seen
 }
 
-// processCertificateFile processes a single certificate file during directory walk
-func processCertificateFile(path string, d fs.DirEntry, walkErr error, dirPath string, seen map[string]int, dryRun bool) error {
-	if walkErr != nil {
-		return nil // Continue walking despite errors
-	}
+// processIndividualCertificatesForMetrics processes certificates again to update individual metrics
+func processIndividualCertificatesForMetrics(processor certificate.Processor, dirPath string, options certificate.ProcessingOptions, duplicates certificate.DuplicateMap) {
+	collector := metricsRegistry.GetCollector()
 
-	if d.IsDir() {
-		return handleDirectory(d)
-	}
-
-	if !utils.IsCertificateFile(d.Name()) {
-		return nil
-	}
-
-	logger := log.WithFields(log.Fields{
-		"file":      path,
-		"directory": dirPath,
-	})
-
-	// Check cache first
-	cached, info, found, err := globalState.getCacheEntryAtomic(path)
+	// We need to scan the directory again to get individual certificate results
+	// This is a bit inefficient, but maintains compatibility with existing metrics
+	scanner := certificate.NewScanner()
+	files, err := scanner.ScanDirectory(dirPath)
 	if err != nil {
-		logger.WithError(err).Warn("File stat failed")
-		if !dryRun && shouldWriteMetrics() {
-			metrics.CertParseErrors.WithLabelValues(path).Inc()
-		}
-		return nil
+		log.WithError(err).WithField("directory", dirPath).Warn("Failed to scan directory for metrics processing")
+		return
 	}
 
-	if !dryRun && shouldWriteMetrics() {
-		metrics.CertFilesTotal.WithLabelValues(dirPath).Inc()
-	}
-
-	// Skip if file unchanged
-	if found && cached.ModTime.Equal(info.ModTime()) && cached.Size == info.Size() {
-		logger.Debug("Skipping unchanged file based on cache")
-
-		// Record cache hit
-		globalState.certCacheLock.Lock()
-		globalState.cacheHits++
-		globalState.certCacheLock.Unlock()
-
-		logger.WithField("cache_status", "hit").Debug("Cache hit for unchanged file")
-
-		return nil
-	}
-
-	// Record cache miss (file changed or not in cache)
-	globalState.certCacheLock.Lock()
-	globalState.cacheMisses++
-	globalState.certCacheLock.Unlock()
-
-	if found {
-		logger.WithFields(log.Fields{
-			"cache_status": "miss",
-			"reason":       "file_changed",
-			"old_mod_time": cached.ModTime,
-			"new_mod_time": info.ModTime(),
-			"old_size":     cached.Size,
-			"new_size":     info.Size(),
-		}).Debug("Cache miss due to file change")
-	} else {
-		logger.WithFields(log.Fields{
-			"cache_status": "miss",
-			"reason":       "not_in_cache",
-		}).Debug("Cache miss for new file")
-	}
-
-	// Process the certificate file
-	cert, err := parseCertificateFile(path, filepath.Ext(path))
-	if err != nil {
-		logger.WithError(err).Warn("Certificate parsing failed")
-		if !dryRun && shouldWriteMetrics() {
-			metrics.CertParseErrors.WithLabelValues(path).Inc()
-		}
-		return nil
-	}
-
-	if cert == nil {
-		logger.Debug("No valid certificate found in file")
-		return nil
-	}
-
-	if !dryRun && shouldWriteMetrics() {
-		metrics.CertsParsedTotal.WithLabelValues(dirPath).Inc()
-	}
-
-	// Log certificate file processing for debugging metric issues
-	log.WithFields(log.Fields{
-		"file":      path,
-		"directory": dirPath,
-	}).Debug("Successfully parsed certificate, proceeding to metrics update")
-
-	// Process certificate and update metrics
-	globalState.processCertificate(cert, path, dirPath, seen, dryRun, info)
-
-	logger.WithFields(log.Fields{
-		"common_name": cert.Subject.CommonName,
-		"issuer":      cert.Issuer.CommonName,
-		"not_after":   cert.NotAfter,
-		"sans":        len(cert.DNSNames),
-	}).Info("Certificate processed successfully")
-
-	return nil
-}
-
-// handleDirectory determines whether to process or skip a directory
-func handleDirectory(d fs.DirEntry) error {
-	dirName := strings.ToLower(d.Name())
-	if dirName == "old" || dirName == "working" {
-		log.WithField("directory", d.Name()).Info("Skipping excluded subdirectory")
-		return filepath.SkipDir
-	}
-	return nil
-}
-
-// parseCertificateFile parses a certificate file and returns the leaf certificate
-func parseCertificateFile(path, ext string) (*x509.Certificate, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-
-	if ext == ".der" {
-		return x509.ParseCertificate(raw)
-	}
-
-	// For PEM files, find the first (leaf) certificate
-	rest := raw
-	for {
-		block, remaining := pem.Decode(rest)
-		rest = remaining
-		if block == nil {
-			break
-		}
-
-		if block.Type != "CERTIFICATE" {
+	for _, fileInfo := range files {
+		result, err := processor.ProcessFile(fileInfo.Path, options)
+		if err != nil {
+			collector.RecordParseError(fileInfo.Path)
 			continue
 		}
 
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue // Try next block
+		if result.Certificate == nil || result.Info == nil {
+			continue
 		}
 
-		return cert, nil // Return first valid certificate (leaf)
+		// Get duplicate count for this certificate
+		fingerprint := fmt.Sprintf("%x", sha256.Sum256(result.Certificate.Raw))
+		duplicateCount := duplicates[fingerprint]
+
+		// Update individual certificate metrics
+		certMetrics := metrics.CreateCertificateMetrics(result.Info, duplicateCount) // Already returns pointer now
+		collector.UpdateCertificate(certMetrics)
+
+		log.WithFields(log.Fields{
+			"common_name": result.Info.CommonName,
+			"issuer":      result.Info.Issuer,
+			"not_after":   result.Info.NotAfter,
+			"sans":        len(result.Info.SANs),
+		}).Debug("Certificate processed successfully for metrics")
 	}
-
-	return nil, fmt.Errorf("no valid certificate found")
-}
-
-// processCertificate processes a parsed certificate and updates metrics
-func (gs *GlobalState) processCertificate(cert *x509.Certificate, path, dirPath string, seen map[string]int, dryRun bool, info os.FileInfo) {
-	filename := filepath.Base(path)
-	sanitizedFilename := utils.SanitizeLabelValue(filename)
-	sanitizedCN := utils.SanitizeLabelValue(cert.Subject.CommonName)
-
-	// Track duplicates
-	fingerprint := sha256.Sum256(cert.Raw)
-	fingerprintKey := fmt.Sprintf("%x", fingerprint)
-
-	// Log certificate processing to help debug potential double-processing issues
-	log.WithFields(log.Fields{
-		"file":        filename,
-		"fingerprint": fingerprintKey[:16], // Show first 16 chars of fingerprint
-	}).Debug("Processing certificate for metrics")
-
-	seen[fingerprintKey]++
-
-	// Create certificate info
-	certInfo := &CertificateInfo{
-		CommonName:          cert.Subject.CommonName,
-		Issuer:              cert.Issuer.CommonName,
-		NotBefore:           cert.NotBefore,
-		NotAfter:            cert.NotAfter,
-		SANs:                cert.DNSNames,
-		Type:                "leaf_certificate",
-		IssuerCode:          utils.DetermineIssuerCode(cert),
-		IsWeakKey:           utils.IsWeakKey(cert),
-		HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
-	}
-
-	// Additional validation logging for debugging metric consistency
-	log.WithFields(log.Fields{
-		"file":                  filename,
-		"common_name":           cert.Subject.CommonName,
-		"has_weak_key":          certInfo.IsWeakKey,
-		"has_deprecated_sigalg": certInfo.HasDeprecatedSigAlg,
-		"duplicate_count":       seen[fingerprintKey],
-		"dry_run":               dryRun,
-	}).Debug("Certificate analysis complete, updating metrics")
-
-	// Update metrics if not in dry run mode
-	if !dryRun && shouldWriteMetrics() {
-		updateCertificateMetrics(certInfo, sanitizedCN, sanitizedFilename, seen[fingerprintKey])
-	}
-
-	// Update cache
-	gs.setCacheEntryAtomic(path, fingerprint, info)
-}
-
-// updateCertificateMetrics updates all certificate-related metrics
-func updateCertificateMetrics(certInfo *CertificateInfo, sanitizedCN, sanitizedFilename string, duplicateCount int) {
-	cfg := globalState.getConfig()
-
-	// Basic certificate metrics
-	metrics.CertExpiration.WithLabelValues(certInfo.CommonName, sanitizedFilename).Set(float64(certInfo.NotAfter.Unix()))
-	metrics.CertSANCount.WithLabelValues(certInfo.CommonName, sanitizedFilename).Set(float64(len(certInfo.SANs)))
-	metrics.CertDuplicateCount.WithLabelValues(certInfo.CommonName, sanitizedFilename).Set(float64(duplicateCount))
-	metrics.CertIssuerCode.WithLabelValues(sanitizedCN, sanitizedFilename).Set(float64(certInfo.IssuerCode))
-
-	// SAN information
-	sanitizedSANs := prepareSANsForMetrics(certInfo.SANs)
-	metrics.CertInfo.WithLabelValues(certInfo.CommonName, sanitizedFilename, sanitizedSANs).Set(1)
-
-	// Weak crypto metrics (if enabled)
-	if cfg.EnableWeakCryptoMetrics {
-		// Note: We reset these counters at the start of each scan cycle in resetMetrics()
-		// This ensures that when certificates are removed, their contribution to weak
-		// crypto metrics is also removed. The counters are then rebuilt from scratch
-		// during each complete directory scan, providing an accurate current state.
-		// IMPORTANT: Each certificate should only increment these counters once per scan.
-		// The metrics are reset at scan start and rebuilt completely during the scan,
-		// ensuring accurate counts that reflect the current certificate inventory.
-
-		if certInfo.IsWeakKey {
-			metrics.WeakKeyCounter.WithLabelValues(certInfo.CommonName, sanitizedFilename).Inc()
-			// Log weak key detection with detailed information for audit trail
-			// This helps verify that weak keys are being counted correctly
-			// and not being double-counted due to processing errors
-			log.WithFields(log.Fields{
-				"file":               sanitizedFilename,
-				"common_name":        certInfo.CommonName,
-				"key_type":           "weak",
-				"metric_incremented": "ssl_cert_weak_key_total",
-			}).Warn("Weak key detected in certificate")
-		}
-
-		if certInfo.HasDeprecatedSigAlg {
-			metrics.DeprecatedSigAlgCounter.WithLabelValues(certInfo.CommonName, sanitizedFilename).Inc()
-			// Log deprecated signature algorithm detection for debugging
-			// This helps track which certificates have deprecated algorithms
-			// and ensures we're not double-counting certificates
-			log.WithFields(log.Fields{
-				"file":                sanitizedFilename,
-				"common_name":         certInfo.CommonName,
-				"metric_incremented":  "ssl_cert_deprecated_sigalg_total",
-				"scan_cycle":          "current",
-				"signature_algorithm": "deprecated",
-			}).Warn("Deprecated signature algorithm detected in certificate")
-		}
-	}
-}
-
-// prepareSANsForMetrics formats SANs for Prometheus metrics
-func prepareSANsForMetrics(sans []string) string {
-	if len(sans) == 0 {
-		return ""
-	}
-
-	limitedSANs := sans
-	if len(limitedSANs) > utils.MaxSANsExported {
-		limitedSANs = limitedSANs[:utils.MaxSANsExported]
-	}
-
-	return utils.SanitizeLabelValue(strings.Join(limitedSANs, ","))
 }
 
 // Scan Backoff Management
@@ -805,60 +336,20 @@ func shouldWriteMetrics() bool {
 
 // resetMetrics resets all Prometheus metrics
 func resetMetrics(clearCache bool) {
-	log.Info("Resetting Prometheus metrics")
-
-	// Get current metric values before reset for logging/debugging
-	weakKeyCount := getCurrentMetricValue(metrics.WeakKeyCounter)
-	deprecatedSigAlgCount := getCurrentMetricValue(metrics.DeprecatedSigAlgCounter)
-
-	log.WithFields(log.Fields{
-		"weak_keys_before_reset":         weakKeyCount,
-		"deprecated_sigalg_before_reset": deprecatedSigAlgCount,
-	}).Debug("Metric counts before reset")
-
-	metrics.CertExpiration.Reset()
-	metrics.CertSANCount.Reset()
-	metrics.CertInfo.Reset()
-	metrics.CertDuplicateCount.Reset()
-	metrics.CertParseErrors.Reset()
-	metrics.CertFilesTotal.Reset()
-	metrics.CertsParsedTotal.Reset()
-	metrics.CertIssuerCode.Reset()
-
-	// Reset counter metrics that track current state rather than cumulative totals
-	// These counters need to be reset on each scan to accurately reflect the current
-	// certificate inventory, since removed certificates should no longer contribute
-	// to the count of weak keys or deprecated signature algorithms
-	metrics.WeakKeyCounter.Reset()
-	metrics.DeprecatedSigAlgCounter.Reset()
+	if metricsRegistry != nil {
+		if clearCache {
+			metricsRegistry.Reset()
+		} else {
+			metricsRegistry.GetCollector().ResetCounters()
+		}
+	}
 
 	if clearCache {
-		globalState.certCacheLock.Lock()
-		globalState.certCache = make(map[string]CachedCertMeta)
-		// Reset cache statistics when clearing cache
-		oldHits := globalState.cacheHits
-		oldMisses := globalState.cacheMisses
-		globalState.cacheHits = 0
-		globalState.cacheMisses = 0
-		globalState.certCacheLock.Unlock()
-
-		log.WithFields(log.Fields{
-			"cleared_entries": "all",
-			"reset_hits":      oldHits,
-			"reset_misses":    oldMisses,
-		}).Info("Certificate cache and statistics cleared")
-
-		log.Info("Certificate cache cleared")
+		if cacheManager != nil {
+			cacheManager.Clear()
+			log.Info("Certificate cache cleared via cache manager")
+		}
 	}
-}
-
-// getCurrentMetricValue safely retrieves the current total value of a counter metric
-// This is used for debugging and logging purposes to track metric changes
-func getCurrentMetricValue(counterVec *prometheus.CounterVec) float64 {
-	// Implementation would gather current metric values
-	// This is primarily for debugging purposes
-	// Note: In production, this could be optimized or removed if not needed
-	return 0.0 // Placeholder - actual implementation would sum counter values
 }
 
 // HTTP Handlers
@@ -936,29 +427,18 @@ func addCertificateStats(checks map[string]string) {
 	checks["certs_parsed_total"] = fmt.Sprintf("%d", totalParsed)
 	checks["cert_parse_errors_total"] = fmt.Sprintf("%d", totalErrors)
 
-	// Add cache statistics to health checks
-	globalState.certCacheLock.RLock()
-	cacheSize := len(globalState.certCache)
-	hits := globalState.cacheHits
-	misses := globalState.cacheMisses
-	globalState.certCacheLock.RUnlock()
-
-	// Calculate and add hit rate to health checks
-	totalAccesses := hits + misses
-	var hitRate float64
-	if totalAccesses > 0 {
-		hitRate = float64(hits) / float64(totalAccesses) * 100
+	if cacheManager != nil {
+		stats := cacheManager.Stats()
+		checks["cache_entries_total"] = fmt.Sprintf("%d", stats.TotalEntries)
+		checks["cache_hit_rate"] = fmt.Sprintf("%.2f%%", stats.HitRate)
+		checks["cache_total_accesses"] = fmt.Sprintf("%d", stats.CacheHits+stats.CacheMisses)
+		checks["cache_file_path"] = stats.CacheFilePath
 	}
 
-	checks["cache_entries_total"] = fmt.Sprintf("%d", cacheSize)
-	checks["cache_hit_rate"] = fmt.Sprintf("%.2f%%", hitRate)
-	checks["cache_total_accesses"] = fmt.Sprintf("%d", totalAccesses)
-	checks["cache_file_path"] = globalState.cacheFilePath
-
 	// Check if cache file is writable
-	if globalState.cacheFilePath != "" {
+	if cacheManager != nil && cacheManager.Stats().CacheFilePath != "" {
 		checks["cache_file_writable"] = "ok"
-		if err := checkCacheFileWritable(globalState.cacheFilePath); err != nil {
+		if err := checkCacheFileWritable(cacheManager.Stats().CacheFilePath); err != nil {
 			checks["cache_file_writable"] = err.Error()
 		}
 	}
@@ -968,7 +448,7 @@ func addCertificateStats(checks map[string]string) {
 func gatherCertificateMetrics() (int, int, int) {
 	totalFiles, totalParsed, totalErrors := 0, 0, 0
 
-	mfs, err := prometheus.DefaultGatherer.Gather()
+	mfs, err := metricsRegistry.GatherMetrics()
 	if err != nil {
 		log.WithError(err).Warn("Failed to gather Prometheus metrics for health check")
 		return totalFiles, totalParsed, totalErrors
@@ -1108,25 +588,15 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Get cache statistics
-	globalState.certCacheLock.RLock()
-	cacheSize := len(globalState.certCache)
-	hits := globalState.cacheHits
-	misses := globalState.cacheMisses
-	globalState.certCacheLock.RUnlock()
-
-	// Calculate hit rate
-	var hitRate float64
-	totalAccesses := hits + misses
-	if totalAccesses > 0 {
-		hitRate = float64(hits) / float64(totalAccesses) * 100
-	}
-
-	cacheStats := CacheStats{
-		TotalEntries:  cacheSize,
-		CacheFilePath: globalState.cacheFilePath,
-		HitRate:       hitRate,
-		LastPruneTime: "available_on_next_prune",
+	var cacheStats CacheStats
+	if cacheManager != nil {
+		stats := cacheManager.Stats()
+		cacheStats = CacheStats{
+			TotalEntries:  stats.TotalEntries,
+			CacheFilePath: stats.CacheFilePath,
+			HitRate:       stats.HitRate,
+			LastPruneTime: stats.LastPruneTime,
+		}
 	}
 
 	status := ConfigStatus{
@@ -1159,65 +629,53 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // collectCertificateInfo collects certificate information for the API
-func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
-	var certificates []CertificateInfo
+func collectCertificateInfo(cfg *config.Config) []certificate.Info {
+	var certificates []certificate.Info
 
-	globalState.certCacheLock.RLock()
-	paths := make([]string, 0, len(globalState.certCache))
-	for path := range globalState.certCache {
-		paths = append(paths, path)
-	}
-	globalState.certCacheLock.RUnlock()
+	// Since we don't have direct access to cached paths in the new cache manager,
+	// we need to scan directories to collect certificate info
+	for _, dir := range cfg.CertDirs {
+		processor := certificate.NewProcessor()
+		options := certificate.ProcessingOptions{
+			ExpiryThresholdDays: cfg.ExpiryThresholdDays,
+			DryRun:              false,
+			EnableWeakCrypto:    cfg.EnableWeakCryptoMetrics,
+		}
 
-	expiryThreshold := time.Duration(cfg.ExpiryThresholdDays) * 24 * time.Hour
-
-	for _, path := range paths {
-		if cert := loadCertificateFromFile(path); cert != nil {
-			// Extract the base filename from the full path for the API response
-			// This provides a clean filename without the full directory path
-			fileName := filepath.Base(path)
-
-			certInfo := CertificateInfo{
-				CommonName:          cert.Subject.CommonName,
-				FileName:            fileName,
-				Issuer:              cert.Issuer.CommonName,
-				NotBefore:           cert.NotBefore,
-				NotAfter:            cert.NotAfter,
-				SANs:                cert.DNSNames,
-				ExpiringSoon:        time.Until(cert.NotAfter) <= expiryThreshold,
-				Type:                "leaf_certificate",
-				IssuerCode:          utils.DetermineIssuerCode(cert),
-				IsWeakKey:           utils.IsWeakKey(cert),
-				HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
+		scanner := certificate.NewScanner()
+		if files, err := scanner.ScanDirectory(dir); err == nil {
+			for _, fileInfo := range files {
+				if result, err := processor.ProcessFile(fileInfo.Path, options); err == nil && result.Info != nil {
+					certificates = append(certificates, *result.Info)
+				}
 			}
-			certificates = append(certificates, certInfo)
 		}
 	}
 
 	return certificates
 }
 
-// loadCertificateFromFile loads and parses a certificate from a file
-func loadCertificateFromFile(path string) *x509.Certificate {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
+// // loadCertificateFromFile loads and parses a certificate from a file
+// func loadCertificateFromFile(path string) *x509.Certificate {
+// 	raw, err := os.ReadFile(path)
+// 	if err != nil {
+// 		return nil
+// 	}
 
-	// Try PEM first
-	if block, _ := pem.Decode(raw); block != nil && block.Type == "CERTIFICATE" {
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-			return cert
-		}
-	}
+// 	// Try PEM first
+// 	if block, _ := pem.Decode(raw); block != nil && block.Type == "CERTIFICATE" {
+// 		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+// 			return cert
+// 		}
+// 	}
 
-	// Try DER
-	if cert, err := x509.ParseCertificate(raw); err == nil {
-		return cert
-	}
+// 	// Try DER
+// 	if cert, err := x509.ParseCertificate(raw); err == nil {
+// 		return cert
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 // Health Check Functions
 // =====================
@@ -1454,7 +912,7 @@ func reloadConfigAndTrigger() {
 			triggerReload()
 		}
 	} else {
-		log.WithError(fmt.Errorf(result.Error)).Warn("Configuration hot-reload failed")
+		log.WithError(errors.New(result.Error)).Warn("Configuration hot-reload failed")
 	}
 }
 
@@ -1638,54 +1096,9 @@ func migrateCacheFile(oldPath, newPath string) error {
 		return nil // No migration needed
 	}
 
-	log.WithFields(log.Fields{
-		"old_cache_file": oldPath,
-		"new_cache_file": newPath,
-	}).Info("Starting cache file migration")
-
-	// Perform cache consistency check before migration
-	preRemoved := globalState.pruneCacheNonExisting()
-	if preRemoved > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries": preRemoved,
-			"phase":           "pre_migration",
-		}).Info("Cleaned stale cache entries before migration")
+	if cacheManager != nil {
+		return cache.MigrateCache(oldPath, newPath)
 	}
-
-	// Save current cache to new location
-	if err := globalState.saveCacheToFile(newPath); err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"old_cache_file": oldPath,
-			"new_cache_file": newPath,
-		}).Error("Failed to save cache to new location during migration")
-		return fmt.Errorf("failed to save cache to new location: %w", err)
-	}
-
-	// Ensure cache consistency after migration by removing any stale entries
-	// that might have been created during the migration process
-	postRemoved := globalState.pruneCacheNonExisting()
-	if postRemoved > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries": postRemoved,
-			"phase":           "post_migration",
-		}).Info("Pruned stale entries after cache migration")
-
-		// Save the cleaned cache to the new location to ensure consistency
-		if err := globalState.saveCacheToFile(newPath); err != nil {
-			log.WithError(err).WithField("cache_file", newPath).Warn("Failed to save cleaned cache after migration")
-		} else {
-			log.WithField("cache_file", newPath).Debug("Saved cleaned cache after migration")
-		}
-	}
-
-	log.WithField("new_cache_file", newPath).Info("Global cache file path updated")
-
-	log.WithFields(log.Fields{
-		"old_cache_file":         oldPath,
-		"new_cache_file":         newPath,
-		"pre_migration_cleanup":  preRemoved,
-		"post_migration_cleanup": postRemoved,
-	}).Info("Cache file migration completed successfully")
 
 	return nil
 }
@@ -1818,11 +1231,13 @@ func runMainProcessingLoop(ctx context.Context) {
 			return
 		case <-cacheMaintenanceTicker.C:
 			// Periodic cache cleanup to handle any missed deletions
-			if removed := globalState.pruneCacheNonExisting(); removed > 0 {
-				log.WithField("removed_entries", removed).Debug("Periodic cache maintenance removed stale entries")
-				// Save updated cache after cleanup
-				if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
-					log.WithError(err).Debug("Failed to save cache after periodic maintenance")
+			if cacheManager != nil {
+				if removed := cacheManager.Prune(); removed > 0 {
+					log.WithField("removed_entries", removed).Debug("Periodic cache maintenance removed stale entries")
+					// Save updated cache after cleanup
+					if err := cacheManager.Save(cacheManager.Stats().CacheFilePath); err != nil {
+						log.WithError(err).Debug("Failed to save cache after periodic maintenance")
+					}
 				}
 			}
 		case _, ok := <-globalState.reloadCh:
@@ -1930,34 +1345,33 @@ func waitForWorkers(wg *sync.WaitGroup, workerCtx context.Context, workerCancel 
 // performPostScanMaintenance performs cleanup tasks after certificate scanning
 func performPostScanMaintenance() {
 	// Prune stale cache entries
-	if removed := globalState.pruneCacheNonExisting(); removed > 0 {
-		log.WithField("removed_entries", removed).Info("Pruned stale cache entries after scan")
+	if cacheManager != nil {
+		if removed := cacheManager.Prune(); removed > 0 {
+			log.WithField("removed_entries", removed).Info("Pruned stale cache entries after scan")
+		}
 	}
 
 	// Clear expired backoff entries
 	clearExpiredBackoffs()
 
 	// Save cache to disk
-	if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
-		log.WithError(err).Warn("Failed to save certificate cache after scan")
-	} else {
-		// Log cache statistics after successful save
-		globalState.certCacheLock.RLock()
-		cacheSize := len(globalState.certCache)
-		hits := globalState.cacheHits
-		misses := globalState.cacheMisses
-		globalState.certCacheLock.RUnlock()
-
-		log.WithFields(log.Fields{
-			"cache_entries": cacheSize,
-			"cache_hits":    hits,
-			"cache_misses":  misses,
-			"hit_rate":      fmt.Sprintf("%.2f%%", float64(hits)/float64(hits+misses)*100),
-		}).Debug("Cache statistics after scan maintenance")
+	if cacheManager != nil {
+		if err := cacheManager.Save(cacheManager.Stats().CacheFilePath); err != nil {
+			log.WithError(err).Warn("Failed to save certificate cache after scan")
+		} else {
+			// Log cache statistics after successful save
+			stats := cacheManager.Stats()
+			log.WithFields(log.Fields{
+				"cache_entries": stats.TotalEntries,
+				"cache_hits":    stats.CacheHits,
+				"cache_misses":  stats.CacheMisses,
+				"hit_rate":      fmt.Sprintf("%.2f%%", stats.HitRate),
+			}).Debug("Cache statistics after scan maintenance")
+		}
 	}
 
 	// Update reload timestamp
-	metrics.LastReload.Set(float64(time.Now().Unix()))
+	metricsRegistry.GetCollector().UpdateReloadTimestamp()
 
 	// Post-scan metric validation for debugging and consistency checking
 	validateMetricConsistency()
@@ -1968,22 +1382,15 @@ func performPostScanMaintenance() {
 // metrics are working correctly and that counts reflect reality
 func validateMetricConsistency() {
 	// Get current certificate count from cache
-	globalState.certCacheLock.RLock()
-	totalCertsInCache := len(globalState.certCache)
-	globalState.certCacheLock.RUnlock()
+	var totalCertsInCache int
+	if cacheManager != nil {
+		totalCertsInCache = cacheManager.Size()
+	}
 
 	log.WithFields(log.Fields{
 		"certificates_in_cache": totalCertsInCache,
 		"validation":            "post_scan_metrics",
 	}).Debug("Post-scan metric consistency check")
-
-	// Additional validation could include:
-	// - Comparing metric totals against expected counts
-	// - Verifying that no certificates were double-counted
-	// - Ensuring removed certificates don't contribute to current counts
-
-	// This function serves as a hook for future metric validation enhancements
-	// and provides a clear audit trail of metric state after each scan cycle
 }
 
 // Runtime Metrics Collection
@@ -2001,7 +1408,6 @@ func runRuntimeMetricsCollector(ctx context.Context) {
 	ticker := time.NewTicker(utils.RuntimeMetricsInterval)
 	defer ticker.Stop()
 
-	var memStats runtime.MemStats
 	log.Info("Runtime metrics collection enabled")
 
 	for {
@@ -2010,8 +1416,7 @@ func runRuntimeMetricsCollector(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if shouldWriteMetrics() {
-				runtime.ReadMemStats(&memStats)
-				metrics.HeapAllocGauge.Set(float64(memStats.HeapAlloc))
+				metricsRegistry.GetCollector().UpdateRuntimeMetrics()
 			}
 		}
 	}
@@ -2055,13 +1460,9 @@ func handleFileSystemEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
 	if event.Op&fsnotify.Remove != 0 {
 		// Immediately remove from cache if it's a certificate file
 		if utils.IsCertificateFile(filepath.Base(event.Name)) {
-			globalState.certCacheLock.Lock()
-			if _, exists := globalState.certCache[event.Name]; exists {
-				delete(globalState.certCache, event.Name)
-				globalState.certCacheLock.Unlock()
+			if cacheManager != nil {
+				cacheManager.Delete(event.Name)
 				logger.WithField("cache_entry", event.Name).Debug("Removed deleted certificate from cache")
-			} else {
-				globalState.certCacheLock.Unlock()
 			}
 		}
 
@@ -2069,22 +1470,8 @@ func handleFileSystemEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
 		if info, err := os.Stat(event.Name); os.IsNotExist(err) || (err == nil && info.IsDir()) {
 			removeDirectoryFromWatcher(watcher, event.Name)
 
-			// Remove all cache entries for files in deleted directory
-			globalState.certCacheLock.Lock()
-			removed := 0
-			for cachePath := range globalState.certCache {
-				if strings.HasPrefix(cachePath, event.Name) {
-					delete(globalState.certCache, cachePath)
-					removed++
-				}
-			}
-			globalState.certCacheLock.Unlock()
-			if removed > 0 {
-				logger.WithFields(log.Fields{
-					"removed_entries": removed,
-					"directory":       event.Name,
-				}).Debug("Removed cache entries for deleted directory")
-			}
+			// Note: Directory removal cache cleanup will be handled by periodic pruning
+			logger.WithField("directory", event.Name).Debug("Directory removed, cache will be pruned on next cycle")
 		}
 	}
 
@@ -2203,7 +1590,7 @@ func startHTTPServer(ctx context.Context, cfg *config.Config) *http.Server {
 
 // setupHTTPRoutes configures HTTP endpoints
 func setupHTTPRoutes(cfg *config.Config) {
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/metrics", metricsRegistry.Handler())
 	http.HandleFunc("/healthz", healthHandler)
 	http.HandleFunc("/certs", certsHandler)
 	http.HandleFunc("/reload", reloadConfigHandler)
@@ -2471,28 +1858,36 @@ func main() {
 	// Parse configuration and command line arguments
 	cfg := parseCommandLineFlags()
 
+	// Initialize metrics registry
+	metricsConfig := metrics.Config{
+		EnableRuntimeMetrics:    cfg.EnableRuntimeMetrics,
+		EnableWeakCryptoMetrics: cfg.EnableWeakCryptoMetrics,
+		Registry:                nil, // Use default registry
+	}
+	metricsRegistry = metrics.NewRegistry(metricsConfig)
+	log.Info("Metrics system initialized")
+
 	// Initialize logging
 	initLogger(cfg.LogFile, cfg.DryRun)
 
 	// Initialize cache
-	globalState.cacheFilePath = cfg.CacheFile
-	if err := globalState.loadCacheFromFile(globalState.cacheFilePath); err != nil {
+	cacheConfig := cache.Config{
+		FilePath:    cfg.CacheFile,
+		AutoSave:    false,
+		MaxEntries:  0, // No limit
+		EnableStats: true,
+	}
+	cacheManager = cache.NewManager(cacheConfig)
+
+	if err := cacheManager.Load(cfg.CacheFile); err != nil {
 		log.WithError(err).Warn("Cache loading failed, starting with empty cache")
-
-		// Reset cache statistics on failed load
-		globalState.certCacheLock.Lock()
-		globalState.cacheHits = 0
-		globalState.cacheMisses = 0
-		globalState.certCacheLock.Unlock()
-
-		log.Info("Cache statistics reset due to failed cache load")
 	}
 
 	// Prune stale cache entries
-	if removed := globalState.pruneCacheNonExisting(); removed > 0 {
+	if removed := cacheManager.Prune(); removed > 0 {
 		log.WithField("removed_entries", removed).Info("Removed stale cache entries during startup")
 
-		if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
+		if err := cacheManager.Save(cfg.CacheFile); err != nil {
 			log.WithError(err).Warn("Failed to save cache after pruning")
 		} else {
 			log.Info("Cache saved successfully after startup pruning")
@@ -2502,15 +1897,13 @@ func main() {
 	}
 
 	// Log initial cache state
-	globalState.certCacheLock.RLock()
-	initialCacheSize := len(globalState.certCache)
-	globalState.certCacheLock.RUnlock()
 
+	stats := cacheManager.Stats()
 	log.WithFields(log.Fields{
-		"cache_file":    globalState.cacheFilePath,
-		"cache_entries": initialCacheSize,
-		"cache_hits":    0,
-		"cache_misses":  0,
+		"cache_file":    stats.CacheFilePath,
+		"cache_entries": stats.TotalEntries,
+		"cache_hits":    stats.CacheHits,
+		"cache_misses":  stats.CacheMisses,
 	}).Info("Certificate cache initialized for startup")
 
 	// Log startup information
@@ -2596,24 +1989,22 @@ func performGracefulShutdown(server *http.Server, watcher *fsnotify.Watcher) {
 	shutdownHTTPServer(server)
 
 	// Log final cache statistics before shutdown
-	globalState.certCacheLock.RLock()
-	finalCacheSize := len(globalState.certCache)
-	finalHits := globalState.cacheHits
-	finalMisses := globalState.cacheMisses
-	globalState.certCacheLock.RUnlock()
 
-	log.WithFields(log.Fields{
-		"final_cache_entries": finalCacheSize,
-		"total_cache_hits":    finalHits,
-		"total_cache_misses":  finalMisses,
-		"final_hit_rate":      fmt.Sprintf("%.2f%%", float64(finalHits)/float64(finalHits+finalMisses)*100),
-	}).Info("Final cache statistics before shutdown")
+	if cacheManager != nil {
+		stats := cacheManager.Stats()
+		log.WithFields(log.Fields{
+			"final_cache_entries": stats.TotalEntries,
+			"total_cache_hits":    stats.CacheHits,
+			"total_cache_misses":  stats.CacheMisses,
+			"final_hit_rate":      fmt.Sprintf("%.2f%%", stats.HitRate),
+		}).Info("Final cache statistics before shutdown")
 
-	// Save final cache state
-	if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
-		log.WithError(err).Warn("Failed to save cache during shutdown")
-	} else {
-		log.Info("Certificate cache saved successfully during shutdown")
+		// Save final cache state
+		if err := cacheManager.Save(stats.CacheFilePath); err != nil {
+			log.WithError(err).Warn("Failed to save cache during shutdown")
+		} else {
+			log.Info("Certificate cache saved successfully during shutdown")
+		}
 	}
 }
 

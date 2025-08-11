@@ -101,4 +101,4 @@ playground/
 
 # Backup files
 *.bak
-*.backup
+*.backup*
