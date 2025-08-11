@@ -41,7 +41,7 @@ var expectedMetrics = []ExpectedMetric{
 	},
 	{
 		Name:        "ssl_cert_san_count",
-		Type:        "gauge", 
+		Type:        "gauge",
 		Description: "Number of SAN entries in cert",
 		Required:    true,
 	},
@@ -63,7 +63,7 @@ var expectedMetrics = []ExpectedMetric{
 		Description: "Numeric code based on certificate issuer",
 		Required:    true,
 	},
-	
+
 	// Processing metrics
 	{
 		Name:        "ssl_cert_parse_errors_total",
@@ -95,7 +95,7 @@ var expectedMetrics = []ExpectedMetric{
 		Description: "Duration of certificate directory scans in seconds",
 		Required:    true,
 	},
-	
+
 	// Security metrics
 	{
 		Name:        "ssl_cert_weak_key_total",
@@ -109,7 +109,7 @@ var expectedMetrics = []ExpectedMetric{
 		Description: "Total number of certificates with deprecated signature algorithms",
 		Required:    false, // Optional, depends on EnableWeakCryptoMetrics
 	},
-	
+
 	// Application metrics
 	{
 		Name:        "ssl_cert_last_reload_timestamp",
@@ -173,12 +173,12 @@ func TestAllMetricsPresent(t *testing.T) {
 			if strings.HasPrefix(metric.Name, expected.Name) {
 				found = true
 				foundMetrics[expected.Name] = true
-				
+
 				// Validate metric type if we can determine it
 				if expected.Type == "counter" && !strings.HasSuffix(metric.Name, "_total") && !strings.Contains(metric.Name, "_bucket") {
 					t.Logf("Warning: Counter metric %s doesn't end with _total", metric.Name)
 				}
-				
+
 				// Log some details about the metric
 				if len(metric.Labels) > 0 {
 					t.Logf("Found metric %s with labels: %v, value: %f", metric.Name, metric.Labels, metric.Value)
@@ -293,17 +293,17 @@ func TestMetricLabels(t *testing.T) {
 
 	// Define expected labels for each metric type
 	expectedLabels := map[string][]string{
-		"ssl_cert_expiration_timestamp": {"common_name", "filename"},
-		"ssl_cert_san_count":           {"common_name", "filename"},
-		"ssl_cert_info":                {"common_name", "filename", "sans"},
-		"ssl_cert_duplicate_count":     {"common_name", "filename"},
-		"ssl_cert_issuer_code":         {"common_name", "filename"},
-		"ssl_cert_parse_errors_total":  {"filename"},
-		"ssl_cert_files_total":         {"dir"},
-		"ssl_certs_parsed_total":       {"dir"},
-		"ssl_cert_last_scan_timestamp": {"dir"},
-		"ssl_cert_scan_duration_seconds": {"dir"},
-		"ssl_cert_weak_key_total":        {"common_name", "filename"},
+		"ssl_cert_expiration_timestamp":    {"common_name", "filename"},
+		"ssl_cert_san_count":               {"common_name", "filename"},
+		"ssl_cert_info":                    {"common_name", "filename", "sans"},
+		"ssl_cert_duplicate_count":         {"common_name", "filename"},
+		"ssl_cert_issuer_code":             {"common_name", "filename"},
+		"ssl_cert_parse_errors_total":      {"filename"},
+		"ssl_cert_files_total":             {"dir"},
+		"ssl_certs_parsed_total":           {"dir"},
+		"ssl_cert_last_scan_timestamp":     {"dir"},
+		"ssl_cert_scan_duration_seconds":   {"dir"},
+		"ssl_cert_weak_key_total":          {"common_name", "filename"},
 		"ssl_cert_deprecated_sigalg_total": {"common_name", "filename"},
 	}
 
@@ -355,11 +355,11 @@ func TestMetricsEndpoint(t *testing.T) {
 	scanner := bufio.NewScanner(resp.Body)
 	lineCount := 0
 	metricCount := 0
-	
+
 	for scanner.Scan() {
 		lineCount++
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Count actual metric lines (not comments or empty lines)
 		if line != "" && !strings.HasPrefix(line, "#") {
 			metricCount++
@@ -367,7 +367,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 
 	t.Logf("Metrics endpoint returned %d lines with %d actual metrics", lineCount, metricCount)
-	
+
 	if metricCount == 0 {
 		t.Error("No metrics found in response")
 	}
@@ -402,16 +402,16 @@ func TestHealthEndpoint(t *testing.T) {
 
 	if checks, ok := health["checks"].(map[string]interface{}); ok {
 		t.Logf("Health checks: %v", checks)
-		
+
 		// Check for expected health check fields
 		expectedChecks := []string{
 			"cert_scan_status",
-			"cert_files_total", 
+			"cert_files_total",
 			"certs_parsed_total",
 			"cache_entries_total",
 			"cache_hit_rate",
 		}
-		
+
 		for _, expected := range expectedChecks {
 			if _, exists := checks[expected]; !exists {
 				t.Errorf("Missing expected health check: %s", expected)
@@ -424,14 +424,14 @@ func TestHealthEndpoint(t *testing.T) {
 func parsePrometheusMetrics(resp *http.Response) ([]MetricValue, error) {
 	var metrics []MetricValue
 	scanner := bufio.NewScanner(resp.Body)
-	
+
 	// Regular expressions for parsing metrics
 	metricRegex := regexp.MustCompile(`^([a-zA-Z_:][a-zA-Z0-9_:]*?)(\{[^}]*\})?\s+([+-]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?)`)
 	labelRegex := regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"`)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		// Skip comments and empty lines
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

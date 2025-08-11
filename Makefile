@@ -108,6 +108,7 @@ test-cleanup:
 	fi
 	@rm -f $(TEST_CONFIG)
 	@rm -f $(TEST_LOG_FILE)
+	@rm -f $(BINARY_NAME)
 	@echo "Test cleanup completed"
 
 create-test-config:

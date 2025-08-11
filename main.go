@@ -26,19 +26,18 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/brandonhon/cert-monitor/internal/config"
 	"github.com/brandonhon/cert-monitor/internal/certificate"
+	"github.com/brandonhon/cert-monitor/internal/config"
+	"github.com/brandonhon/cert-monitor/internal/metrics"
 	"github.com/brandonhon/cert-monitor/pkg/utils"
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -82,39 +81,6 @@ type CachedCertMeta struct {
 	Size        int64     `json:"size"`
 }
 
-// MetricsCollector encapsulates all Prometheus metrics
-type MetricsCollector struct {
-	CertExpiration          *prometheus.GaugeVec
-	CertSANCount            *prometheus.GaugeVec
-	CertInfo                *prometheus.GaugeVec
-	CertDuplicateCount      *prometheus.GaugeVec
-	CertParseErrors         *prometheus.CounterVec
-	CertFilesTotal          *prometheus.CounterVec
-	CertsParsedTotal        *prometheus.CounterVec
-	CertLastScan            *prometheus.GaugeVec
-	LastReload              prometheus.Gauge
-	CertScanDuration        *prometheus.HistogramVec
-	HeapAllocGauge          prometheus.Gauge
-	WeakKeyCounter          *prometheus.CounterVec
-	DeprecatedSigAlgCounter *prometheus.CounterVec
-	CertIssuerCode          *prometheus.GaugeVec
-}
-
-// // CertificateInfo represents parsed certificate data
-// type CertificateInfo struct {
-// 	CommonName          string    `json:"common_name"`
-// 	FileName            string    `json:"file_name"`
-// 	Issuer              string    `json:"issuer"`
-// 	NotBefore           time.Time `json:"not_before"`
-// 	NotAfter            time.Time `json:"not_after"`
-// 	SANs                []string  `json:"sans,omitempty"`
-// 	ExpiringSoon        bool      `json:"expiring_soon"`
-// 	Type                string    `json:"type"`
-// 	IssuerCode          int       `json:"issuer_code"`
-// 	IsWeakKey           bool      `json:"is_weak_key"`
-// 	HasDeprecatedSigAlg bool      `json:"has_deprecated_sig_alg"`
-// }
-
 // HealthResponse represents the health check response
 type HealthResponse struct {
 	Status string            `json:"status"`
@@ -131,8 +97,8 @@ type CacheStats struct {
 
 // Global instances
 var (
-	globalState *GlobalState
-	metrics     *MetricsCollector
+	globalState     *GlobalState
+	metricsRegistry *metrics.Registry
 )
 
 func init() {
@@ -141,105 +107,6 @@ func init() {
 		watchedDirs: make(map[string]bool),
 		certCache:   make(map[string]CachedCertMeta),
 	}
-
-	metrics = initMetrics()
-	registerMetrics()
-}
-
-// initMetrics creates and initializes all Prometheus metrics
-func initMetrics() *MetricsCollector {
-	return &MetricsCollector{
-		CertExpiration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_expiration_timestamp",
-			Help: "Expiration time of SSL cert (Unix timestamp)",
-		}, []string{"common_name", "filename"}),
-
-		CertSANCount: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_san_count",
-			Help: "Number of SAN entries in cert",
-		}, []string{"common_name", "filename"}),
-
-		CertInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_info",
-			Help: "Static info for cert including CN and SANs",
-		}, []string{"common_name", "filename", "sans"}),
-
-		CertDuplicateCount: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_duplicate_count",
-			Help: "Number of times a cert appears",
-		}, []string{"common_name", "filename"}),
-
-		CertParseErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_parse_errors_total",
-			Help: "Number of cert parse errors",
-		}, []string{"filename"}),
-
-		CertFilesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_files_total",
-			Help: "Total number of certificate files processed",
-		}, []string{"dir"}),
-
-		CertsParsedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_certs_parsed_total",
-			Help: "Total number of individual certificates successfully parsed",
-		}, []string{"dir"}),
-
-		CertLastScan: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_last_scan_timestamp",
-			Help: "Unix timestamp of the last successful scan of a certificate directory",
-		}, []string{"dir"}),
-
-		LastReload: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "ssl_cert_last_reload_timestamp",
-			Help: "Unix timestamp of the last successful configuration reload",
-		}),
-
-		CertScanDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "ssl_cert_scan_duration_seconds",
-			Help:    "Duration of certificate directory scans in seconds",
-			Buckets: prometheus.DefBuckets,
-		}, []string{"dir"}),
-
-		HeapAllocGauge: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "ssl_monitor_heap_alloc_bytes",
-			Help: "Heap memory allocated (bytes) as reported by runtime.ReadMemStats",
-		}),
-
-		WeakKeyCounter: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_weak_key_total",
-			Help: "Total number of certificates detected with weak keys (e.g., RSA < 2048 bits)",
-		}, []string{"common_name", "filename"}),
-
-		DeprecatedSigAlgCounter: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ssl_cert_deprecated_sigalg_total",
-			Help: "Total number of certificates with deprecated signature algorithms (e.g., SHA1, MD5)",
-		}, []string{"common_name", "filename"}),
-
-		CertIssuerCode: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ssl_cert_issuer_code",
-			Help: "Numeric code based on certificate issuer (30=digicert, 31=amazon, 32=other, 33=self-signed)",
-		}, []string{"common_name", "filename"}),
-	}
-}
-
-// registerMetrics registers all metrics with Prometheus
-func registerMetrics() {
-	prometheus.MustRegister(
-		metrics.CertExpiration,
-		metrics.CertSANCount,
-		metrics.CertInfo,
-		metrics.CertDuplicateCount,
-		metrics.CertParseErrors,
-		metrics.CertFilesTotal,
-		metrics.CertsParsedTotal,
-		metrics.CertLastScan,
-		metrics.LastReload,
-		metrics.CertScanDuration,
-		metrics.HeapAllocGauge,
-		metrics.WeakKeyCounter,
-		metrics.DeprecatedSigAlgCounter,
-		metrics.CertIssuerCode,
-	)
 }
 
 // Global State Management
@@ -413,7 +280,8 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 	start := time.Now()
 	defer func() {
 		if !dryRun && shouldWriteMetrics() {
-			metrics.CertScanDuration.WithLabelValues(dirPath).Observe(time.Since(start).Seconds())
+			collector := metricsRegistry.GetCollector()
+			collector.CertScanDuration.WithLabelValues(dirPath).Observe(time.Since(start).Seconds())
 		}
 	}()
 
@@ -425,7 +293,8 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 
 	defer func() {
 		if !dryRun && shouldWriteMetrics() {
-			metrics.CertLastScan.WithLabelValues(dirPath).Set(float64(time.Now().Unix()))
+			collector := metricsRegistry.GetCollector()
+			collector.CertLastScan.WithLabelValues(dirPath).Set(float64(time.Now().Unix()))
 		}
 	}()
 
@@ -437,14 +306,9 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 		ExpiryThresholdDays: globalState.getConfig().ExpiryThresholdDays,
 		DryRun:              dryRun,
 		EnableWeakCrypto:    globalState.getConfig().EnableWeakCryptoMetrics,
-		// EnableWeakCrypto:    cfg.EnableWeakCryptoMetrics,
 	}
 
 	// Process certificates and track duplicates
-	// seen := make(map[string]int)
-	// err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
-	// 	return processCertificateFile(path, d, err, dirPath, seen, dryRun)
-	// })
 	stats, duplicates, err := processor.ProcessDirectory(dirPath, options)
 	if err != nil {
 		logger.WithError(err).Warn("Certificate directory processing failed")
@@ -459,8 +323,16 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 
 	// Update metrics based on processing results
 	if !dryRun && shouldWriteMetrics() {
-		metrics.CertFilesTotal.WithLabelValues(dirPath).Add(float64(stats.FilesProcessed))
-		metrics.CertsParsedTotal.WithLabelValues(dirPath).Add(float64(stats.CertsParsed))
+		collector := metricsRegistry.GetCollector()
+
+		// Update directory metrics
+		dirMetrics := metrics.CreateDirectoryMetrics(dirPath, stats)
+		collector.UpdateDirectory(dirMetrics)
+	}
+
+	// Process individual certificates for metrics if we have results
+	if !dryRun && shouldWriteMetrics() {
+		processIndividualCertificatesForMetrics(processor, dirPath, options, duplicates)
 	}
 
 	// Convert DuplicateMap to map[string]int for return compatibility
@@ -484,6 +356,8 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 
 // processIndividualCertificatesForMetrics processes certificates again to update individual metrics
 func processIndividualCertificatesForMetrics(processor certificate.Processor, dirPath string, options certificate.ProcessingOptions, duplicates certificate.DuplicateMap) {
+	collector := metricsRegistry.GetCollector()
+
 	// We need to scan the directory again to get individual certificate results
 	// This is a bit inefficient, but maintains compatibility with existing metrics
 	scanner := certificate.NewScanner()
@@ -496,7 +370,7 @@ func processIndividualCertificatesForMetrics(processor certificate.Processor, di
 	for _, fileInfo := range files {
 		result, err := processor.ProcessFile(fileInfo.Path, options)
 		if err != nil {
-			metrics.CertParseErrors.WithLabelValues(fileInfo.Path).Inc()
+			collector.RecordParseError(fileInfo.Path)
 			continue
 		}
 
@@ -509,11 +383,8 @@ func processIndividualCertificatesForMetrics(processor certificate.Processor, di
 		duplicateCount := duplicates[fingerprint]
 
 		// Update individual certificate metrics
-		filename := filepath.Base(result.Info.FileName)
-		sanitizedFilename := utils.SanitizeLabelValue(filename)
-		sanitizedCN := utils.SanitizeLabelValue(result.Info.CommonName)
-
-		updateCertificateMetrics(result.Info, sanitizedCN, sanitizedFilename, duplicateCount)
+		certMetrics := metrics.CreateCertificateMetrics(result.Info, duplicateCount)
+		collector.UpdateCertificate(certMetrics)
 
 		log.WithFields(log.Fields{
 			"common_name": result.Info.CommonName,
@@ -523,277 +394,6 @@ func processIndividualCertificatesForMetrics(processor certificate.Processor, di
 		}).Debug("Certificate processed successfully for metrics")
 	}
 }
-
-// // processCertificateFile processes a single certificate file during directory walk
-// func processCertificateFile(path string, d fs.DirEntry, walkErr error, dirPath string, seen map[string]int, dryRun bool) error {
-// 	if walkErr != nil {
-// 		return nil // Continue walking despite errors
-// 	}
-
-// 	if d.IsDir() {
-// 		return handleDirectory(d)
-// 	}
-
-// 	if !utils.IsCertificateFile(d.Name()) {
-// 		return nil
-// 	}
-
-// 	logger := log.WithFields(log.Fields{
-// 		"file":      path,
-// 		"directory": dirPath,
-// 	})
-
-// 	// Check cache first
-// 	cached, info, found, err := globalState.getCacheEntryAtomic(path)
-// 	if err != nil {
-// 		logger.WithError(err).Warn("File stat failed")
-// 		if !dryRun && shouldWriteMetrics() {
-// 			metrics.CertParseErrors.WithLabelValues(path).Inc()
-// 		}
-// 		return nil
-// 	}
-
-// 	if !dryRun && shouldWriteMetrics() {
-// 		metrics.CertFilesTotal.WithLabelValues(dirPath).Inc()
-// 	}
-
-// 	// Skip if file unchanged
-// 	if found && cached.ModTime.Equal(info.ModTime()) && cached.Size == info.Size() {
-// 		logger.Debug("Skipping unchanged file based on cache")
-
-// 		// Record cache hit
-// 		globalState.certCacheLock.Lock()
-// 		globalState.cacheHits++
-// 		globalState.certCacheLock.Unlock()
-
-// 		logger.WithField("cache_status", "hit").Debug("Cache hit for unchanged file")
-
-// 		return nil
-// 	}
-
-// 	// Record cache miss (file changed or not in cache)
-// 	globalState.certCacheLock.Lock()
-// 	globalState.cacheMisses++
-// 	globalState.certCacheLock.Unlock()
-
-// 	if found {
-// 		logger.WithFields(log.Fields{
-// 			"cache_status": "miss",
-// 			"reason":       "file_changed",
-// 			"old_mod_time": cached.ModTime,
-// 			"new_mod_time": info.ModTime(),
-// 			"old_size":     cached.Size,
-// 			"new_size":     info.Size(),
-// 		}).Debug("Cache miss due to file change")
-// 	} else {
-// 		logger.WithFields(log.Fields{
-// 			"cache_status": "miss",
-// 			"reason":       "not_in_cache",
-// 		}).Debug("Cache miss for new file")
-// 	}
-
-// 	// Process the certificate file
-// 	cert, err := parseCertificateFile(path, filepath.Ext(path))
-// 	if err != nil {
-// 		logger.WithError(err).Warn("Certificate parsing failed")
-// 		if !dryRun && shouldWriteMetrics() {
-// 			metrics.CertParseErrors.WithLabelValues(path).Inc()
-// 		}
-// 		return nil
-// 	}
-
-// 	if cert == nil {
-// 		logger.Debug("No valid certificate found in file")
-// 		return nil
-// 	}
-
-// 	if !dryRun && shouldWriteMetrics() {
-// 		metrics.CertsParsedTotal.WithLabelValues(dirPath).Inc()
-// 	}
-
-// 	// Log certificate file processing for debugging metric issues
-// 	log.WithFields(log.Fields{
-// 		"file":      path,
-// 		"directory": dirPath,
-// 	}).Debug("Successfully parsed certificate, proceeding to metrics update")
-
-// 	// Process certificate and update metrics
-// 	globalState.processCertificate(cert, path, dirPath, seen, dryRun, info)
-
-// 	logger.WithFields(log.Fields{
-// 		"common_name": cert.Subject.CommonName,
-// 		"issuer":      cert.Issuer.CommonName,
-// 		"not_after":   cert.NotAfter,
-// 		"sans":        len(cert.DNSNames),
-// 	}).Info("Certificate processed successfully")
-
-// 	return nil
-// }
-
-// // handleDirectory determines whether to process or skip a directory
-// func handleDirectory(d fs.DirEntry) error {
-// 	dirName := strings.ToLower(d.Name())
-// 	if dirName == "old" || dirName == "working" {
-// 		log.WithField("directory", d.Name()).Info("Skipping excluded subdirectory")
-// 		return filepath.SkipDir
-// 	}
-// 	return nil
-// }
-
-// // parseCertificateFile parses a certificate file and returns the leaf certificate
-// func parseCertificateFile(path, ext string) (*x509.Certificate, error) {
-// 	raw, err := os.ReadFile(path)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to read file: %w", err)
-// 	}
-
-// 	if ext == ".der" {
-// 		return x509.ParseCertificate(raw)
-// 	}
-
-// 	// For PEM files, find the first (leaf) certificate
-// 	rest := raw
-// 	for {
-// 		block, remaining := pem.Decode(rest)
-// 		rest = remaining
-// 		if block == nil {
-// 			break
-// 		}
-
-// 		if block.Type != "CERTIFICATE" {
-// 			continue
-// 		}
-
-// 		cert, err := x509.ParseCertificate(block.Bytes)
-// 		if err != nil {
-// 			continue // Try next block
-// 		}
-
-// 		return cert, nil // Return first valid certificate (leaf)
-// 	}
-
-// 	return nil, fmt.Errorf("no valid certificate found")
-// }
-
-// // processCertificate processes a parsed certificate and updates metrics
-// func (gs *GlobalState) processCertificate(cert *x509.Certificate, path, dirPath string, seen map[string]int, dryRun bool, info os.FileInfo) {
-// 	filename := filepath.Base(path)
-// 	sanitizedFilename := utils.SanitizeLabelValue(filename)
-// 	sanitizedCN := utils.SanitizeLabelValue(cert.Subject.CommonName)
-
-// 	// Track duplicates
-// 	fingerprint := sha256.Sum256(cert.Raw)
-// 	fingerprintKey := fmt.Sprintf("%x", fingerprint)
-
-// 	// Log certificate processing to help debug potential double-processing issues
-// 	log.WithFields(log.Fields{
-// 		"file":        filename,
-// 		"fingerprint": fingerprintKey[:16], // Show first 16 chars of fingerprint
-// 	}).Debug("Processing certificate for metrics")
-
-// 	seen[fingerprintKey]++
-
-// 	// Create certificate info
-// 	certInfo := &CertificateInfo{
-// 		CommonName:          cert.Subject.CommonName,
-// 		Issuer:              cert.Issuer.CommonName,
-// 		NotBefore:           cert.NotBefore,
-// 		NotAfter:            cert.NotAfter,
-// 		SANs:                cert.DNSNames,
-// 		Type:                "leaf_certificate",
-// 		IssuerCode:          utils.DetermineIssuerCode(cert),
-// 		IsWeakKey:           utils.IsWeakKey(cert),
-// 		HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
-// 	}
-
-// 	// Additional validation logging for debugging metric consistency
-// 	log.WithFields(log.Fields{
-// 		"file":                  filename,
-// 		"common_name":           cert.Subject.CommonName,
-// 		"has_weak_key":          certInfo.IsWeakKey,
-// 		"has_deprecated_sigalg": certInfo.HasDeprecatedSigAlg,
-// 		"duplicate_count":       seen[fingerprintKey],
-// 		"dry_run":               dryRun,
-// 	}).Debug("Certificate analysis complete, updating metrics")
-
-// 	// Update metrics if not in dry run mode
-// 	if !dryRun && shouldWriteMetrics() {
-// 		updateCertificateMetrics(certInfo, sanitizedCN, sanitizedFilename, seen[fingerprintKey])
-// 	}
-
-// 	// Update cache
-// 	gs.setCacheEntryAtomic(path, fingerprint, info)
-// }
-
-// updateCertificateMetrics updates all certificate-related metrics
-// func updateCertificateMetrics(certInfo *CertificateInfo, sanitizedCN, sanitizedFilename string, duplicateCount int) {
-// func updateCertificateMetrics(certInfo *certificate.Info, sanitizedCN, sanitizedFilename string, duplicateCount int) {
-func updateCertificateMetrics(certInfo *certificate.Info, sanitizedCN, sanitizedFilename string, duplicateCount int) {
-	cfg := globalState.getConfig()
-
-	// Basic certificate metrics
-	metrics.CertExpiration.WithLabelValues(certInfo.CommonName, sanitizedFilename).Set(float64(certInfo.NotAfter.Unix()))
-	metrics.CertSANCount.WithLabelValues(certInfo.CommonName, sanitizedFilename).Set(float64(len(certInfo.SANs)))
-	metrics.CertDuplicateCount.WithLabelValues(certInfo.CommonName, sanitizedFilename).Set(float64(duplicateCount))
-	metrics.CertIssuerCode.WithLabelValues(sanitizedCN, sanitizedFilename).Set(float64(certInfo.IssuerCode))
-
-	// SAN information
-	// sanitizedSANs := prepareSANsForMetrics(certInfo.SANs)
-	sanitizedSANs := certificate.PrepareSANsForMetrics(certInfo.SANs)
-	metrics.CertInfo.WithLabelValues(certInfo.CommonName, sanitizedFilename, sanitizedSANs).Set(1)
-
-	// Weak crypto metrics (if enabled)
-	if cfg.EnableWeakCryptoMetrics {
-		// Note: We reset these counters at the start of each scan cycle in resetMetrics()
-		// This ensures that when certificates are removed, their contribution to weak
-		// crypto metrics is also removed. The counters are then rebuilt from scratch
-		// during each complete directory scan, providing an accurate current state.
-		// IMPORTANT: Each certificate should only increment these counters once per scan.
-		// The metrics are reset at scan start and rebuilt completely during the scan,
-		// ensuring accurate counts that reflect the current certificate inventory.
-
-		if certInfo.IsWeakKey {
-			metrics.WeakKeyCounter.WithLabelValues(certInfo.CommonName, sanitizedFilename).Inc()
-			// Log weak key detection with detailed information for audit trail
-			// This helps verify that weak keys are being counted correctly
-			// and not being double-counted due to processing errors
-			log.WithFields(log.Fields{
-				"file":               sanitizedFilename,
-				"common_name":        certInfo.CommonName,
-				"key_type":           "weak",
-				"metric_incremented": "ssl_cert_weak_key_total",
-			}).Warn("Weak key detected in certificate")
-		}
-
-		if certInfo.HasDeprecatedSigAlg {
-			metrics.DeprecatedSigAlgCounter.WithLabelValues(certInfo.CommonName, sanitizedFilename).Inc()
-			// Log deprecated signature algorithm detection for debugging
-			// This helps track which certificates have deprecated algorithms
-			// and ensures we're not double-counting certificates
-			log.WithFields(log.Fields{
-				"file":                sanitizedFilename,
-				"common_name":         certInfo.CommonName,
-				"metric_incremented":  "ssl_cert_deprecated_sigalg_total",
-				"scan_cycle":          "current",
-				"signature_algorithm": "deprecated",
-			}).Warn("Deprecated signature algorithm detected in certificate")
-		}
-	}
-}
-
-// // prepareSANsForMetrics formats SANs for Prometheus metrics
-// func prepareSANsForMetrics(sans []string) string {
-// 	if len(sans) == 0 {
-// 		return ""
-// 	}
-
-// 	limitedSANs := sans
-// 	if len(limitedSANs) > utils.MaxSANsExported {
-// 		limitedSANs = limitedSANs[:utils.MaxSANsExported]
-// 	}
-
-// 	return utils.SanitizeLabelValue(strings.Join(limitedSANs, ","))
-// }
 
 // Scan Backoff Management
 // ======================
@@ -886,32 +486,13 @@ func shouldWriteMetrics() bool {
 
 // resetMetrics resets all Prometheus metrics
 func resetMetrics(clearCache bool) {
-	log.Info("Resetting Prometheus metrics")
-
-	// Get current metric values before reset for logging/debugging
-	weakKeyCount := getCurrentMetricValue(metrics.WeakKeyCounter)
-	deprecatedSigAlgCount := getCurrentMetricValue(metrics.DeprecatedSigAlgCounter)
-
-	log.WithFields(log.Fields{
-		"weak_keys_before_reset":         weakKeyCount,
-		"deprecated_sigalg_before_reset": deprecatedSigAlgCount,
-	}).Debug("Metric counts before reset")
-
-	metrics.CertExpiration.Reset()
-	metrics.CertSANCount.Reset()
-	metrics.CertInfo.Reset()
-	metrics.CertDuplicateCount.Reset()
-	metrics.CertParseErrors.Reset()
-	metrics.CertFilesTotal.Reset()
-	metrics.CertsParsedTotal.Reset()
-	metrics.CertIssuerCode.Reset()
-
-	// Reset counter metrics that track current state rather than cumulative totals
-	// These counters need to be reset on each scan to accurately reflect the current
-	// certificate inventory, since removed certificates should no longer contribute
-	// to the count of weak keys or deprecated signature algorithms
-	metrics.WeakKeyCounter.Reset()
-	metrics.DeprecatedSigAlgCounter.Reset()
+	if metricsRegistry != nil {
+		if clearCache {
+			metricsRegistry.Reset()
+		} else {
+			metricsRegistry.GetCollector().ResetCounters()
+		}
+	}
 
 	if clearCache {
 		globalState.certCacheLock.Lock()
@@ -931,15 +512,6 @@ func resetMetrics(clearCache bool) {
 
 		log.Info("Certificate cache cleared")
 	}
-}
-
-// getCurrentMetricValue safely retrieves the current total value of a counter metric
-// This is used for debugging and logging purposes to track metric changes
-func getCurrentMetricValue(counterVec *prometheus.CounterVec) float64 {
-	// Implementation would gather current metric values
-	// This is primarily for debugging purposes
-	// Note: In production, this could be optimized or removed if not needed
-	return 0.0 // Placeholder - actual implementation would sum counter values
 }
 
 // HTTP Handlers
@@ -1049,7 +621,7 @@ func addCertificateStats(checks map[string]string) {
 func gatherCertificateMetrics() (int, int, int) {
 	totalFiles, totalParsed, totalErrors := 0, 0, 0
 
-	mfs, err := prometheus.DefaultGatherer.Gather()
+	mfs, err := metricsRegistry.GatherMetrics()
 	if err != nil {
 		log.WithError(err).Warn("Failed to gather Prometheus metrics for health check")
 		return totalFiles, totalParsed, totalErrors
@@ -1240,10 +812,6 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // collectCertificateInfo collects certificate information for the API
-//
-//	func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
-//		var certificates []CertificateInfo
-// func collectCertificateInfo(cfg *config.Config) []certificate.Info {
 func collectCertificateInfo(cfg *config.Config) []certificate.Info {
 	var certificates []certificate.Info
 
@@ -2042,7 +1610,7 @@ func performPostScanMaintenance() {
 	}
 
 	// Update reload timestamp
-	metrics.LastReload.Set(float64(time.Now().Unix()))
+	metricsRegistry.GetCollector().UpdateReloadTimestamp()
 
 	// Post-scan metric validation for debugging and consistency checking
 	validateMetricConsistency()
@@ -2086,7 +1654,6 @@ func runRuntimeMetricsCollector(ctx context.Context) {
 	ticker := time.NewTicker(utils.RuntimeMetricsInterval)
 	defer ticker.Stop()
 
-	var memStats runtime.MemStats
 	log.Info("Runtime metrics collection enabled")
 
 	for {
@@ -2095,8 +1662,7 @@ func runRuntimeMetricsCollector(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if shouldWriteMetrics() {
-				runtime.ReadMemStats(&memStats)
-				metrics.HeapAllocGauge.Set(float64(memStats.HeapAlloc))
+				metricsRegistry.GetCollector().UpdateRuntimeMetrics()
 			}
 		}
 	}
@@ -2288,7 +1854,7 @@ func startHTTPServer(ctx context.Context, cfg *config.Config) *http.Server {
 
 // setupHTTPRoutes configures HTTP endpoints
 func setupHTTPRoutes(cfg *config.Config) {
-	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/metrics", metricsRegistry.Handler())
 	http.HandleFunc("/healthz", healthHandler)
 	http.HandleFunc("/certs", certsHandler)
 	http.HandleFunc("/reload", reloadConfigHandler)
@@ -2555,6 +2121,15 @@ func performDryRun(cfg *config.Config) {
 func main() {
 	// Parse configuration and command line arguments
 	cfg := parseCommandLineFlags()
+
+	// Initialize metrics registry
+	metricsConfig := metrics.Config{
+		EnableRuntimeMetrics:    cfg.EnableRuntimeMetrics,
+		EnableWeakCryptoMetrics: cfg.EnableWeakCryptoMetrics,
+		Registry:                nil, // Use default registry
+	}
+	metricsRegistry = metrics.NewRegistry(metricsConfig)
+	log.Info("Metrics system initialized")
 
 	// Initialize logging
 	initLogger(cfg.LogFile, cfg.DryRun)
