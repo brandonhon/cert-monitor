@@ -42,9 +42,9 @@ build-linux:
 	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-linux-amd64 .
 	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-linux-arm64 .
 
-build-windows:
-	@echo "Building for Windows..."
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-windows-amd64.exe .
+# build-windows:
+# 	@echo "Building for Windows..."
+# 	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-windows-amd64.exe .
 
 build-darwin:
 	@echo "Building for macOS..."
