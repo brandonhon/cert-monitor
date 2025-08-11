@@ -147,8 +147,13 @@ jobs:
     
     - name: Check formatting
       run: |
-        if [ -n "$(gofmt -l .)" ]; then
-          echo "Code is not formatted. Please run 'gofmt -w .'"
-          gofmt -l .
+        # Show which files need formatting
+        UNFORMATTED=$(gofmt -l .)
+        if [ -n "$UNFORMATTED" ]; then
+          echo "The following files are not formatted:"
+          echo "$UNFORMATTED"
+          echo ""
+          echo "Please run 'gofmt -w .' or 'make fmt' to fix formatting"
           exit 1
         fi
+        echo "All files are properly formatted"

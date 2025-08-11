@@ -88,13 +88,14 @@ vet:
 
 fmt:
 	@echo "Formatting code..."
-	$(GOFMT) -s -w .
+	gofmt -s -w .
+	go fmt ./...
 
 fmt-check:
 	@echo "Checking code formatting..."
-	@if [ -n "$$($(GOFMT) -l .)" ]; then \
+	@if [ -n "$(gofmt -l .)" ]; then \
 		echo "Code is not formatted. Run 'make fmt' to fix."; \
-		$(GOFMT) -l .; \
+		gofmt -l .; \
 		exit 1; \
 	fi
 
@@ -136,11 +137,11 @@ install-tools:
 # Linting
 lint:
 	@echo "Running golangci-lint..."
-	golangci-lint run
+	golangci-lint run --config .golangci.yml
 
 lint-fix:
 	@echo "Running golangci-lint with auto-fix..."
-	golangci-lint run --fix
+	golangci-lint run --config .golangci.yml --fix
 
 # Docker
 docker-build:

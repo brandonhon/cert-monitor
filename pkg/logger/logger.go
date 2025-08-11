@@ -10,9 +10,9 @@ import (
 
 // Config holds logger configuration
 type Config struct {
-	File     string
-	Level    string
-	DryRun   bool
+	File   string
+	Level  string
+	DryRun bool
 }
 
 // Init initializes the logger with default settings
