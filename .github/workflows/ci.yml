@@ -21,22 +21,20 @@ jobs:
       with:
         go-version: ${{ matrix.go-version }}
     
-    - name: Clear Go modules
-      run: rm -rf ~/go/pkg/mod
-
-    - name: Cache Go modules
+    - name: Set up Go module cache
       uses: actions/cache@v4
       with:
-        path: ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          ${{ runner.os }}-go-
+          ${{ runner.os }}-go-${{ matrix.go-version }}-
     
     - name: Download dependencies
-      run: go mod download
-    
-    - name: Verify dependencies
-      run: go mod verify
+      run: |
+        go mod download
+        go mod verify
     
     - name: Run go vet
       run: go vet ./...
