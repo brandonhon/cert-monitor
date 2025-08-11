@@ -35,16 +35,16 @@ build-static:
 	CGO_ENABLED=0 GOOS=linux $(GOBUILD) $(LDFLAGS) -a -installsuffix cgo -o $(BINARY_NAME)-static .
 
 # Multi-platform builds
-build-all: build-linux build-windows build-darwin
+build-all: build-linux build-darwin #build-windows
 
 build-linux:
 	@echo "Building for Linux..."
 	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-linux-amd64 .
 	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-linux-arm64 .
 
-build-windows:
-	@echo "Building for Windows..."
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-windows-amd64.exe .
+# build-windows:
+# 	@echo "Building for Windows..."
+# 	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-windows-amd64.exe .
 
 build-darwin:
 	@echo "Building for macOS..."
