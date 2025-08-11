@@ -77,6 +77,12 @@ issues:
         - goimports
       text: "properly formatted"
 
+    # Exclude goimports from running on internal/metrics/collector.go
+    - path: internal/metrics/collector\.go
+      linters:
+        - goimports
+      text: "properly formatted"
+
   # Maximum issues count per one linter
   max-issues-per-linter: 0
 

@@ -32,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/brandonhon/cert-monitor/internal/cache"
 	"github.com/brandonhon/cert-monitor/internal/certificate"
 	"github.com/brandonhon/cert-monitor/internal/config"
 	"github.com/brandonhon/cert-monitor/internal/metrics"
@@ -65,20 +66,6 @@ type GlobalState struct {
 	watchedDirs     map[string]bool
 	watchedDirsLock sync.Mutex
 	mainWatcher     *fsnotify.Watcher
-
-	// Certificate cache
-	certCache     map[string]CachedCertMeta
-	certCacheLock sync.RWMutex
-	cacheFilePath string
-	cacheHits     int64
-	cacheMisses   int64
-}
-
-// CachedCertMeta holds metadata for cached certificates
-type CachedCertMeta struct {
-	Fingerprint [32]byte  `json:"fingerprint"`
-	ModTime     time.Time `json:"mod_time"`
-	Size        int64     `json:"size"`
 }
 
 // HealthResponse represents the health check response
@@ -98,6 +85,7 @@ type CacheStats struct {
 // Global instances
 var (
 	globalState     *GlobalState
+	cacheManager    cache.Manager
 	metricsRegistry *metrics.Registry
 )
 
@@ -105,7 +93,6 @@ func init() {
 	globalState = &GlobalState{
 		scanBackoff: make(map[string]time.Time),
 		watchedDirs: make(map[string]bool),
-		certCache:   make(map[string]CachedCertMeta),
 	}
 }
 
@@ -124,141 +111,6 @@ func (gs *GlobalState) setConfig(cfg *config.Config) {
 	gs.configMutex.Lock()
 	defer gs.configMutex.Unlock()
 	gs.config = cfg
-}
-
-// Cache Management
-// ===============
-
-// getCacheEntryAtomic safely retrieves a cache entry and file stat
-func (gs *GlobalState) getCacheEntryAtomic(path string) (CachedCertMeta, os.FileInfo, bool, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return CachedCertMeta{}, nil, false, err
-	}
-
-	gs.certCacheLock.RLock()
-	cached, found := gs.certCache[path]
-	gs.certCacheLock.RUnlock()
-
-	return cached, info, found, nil
-}
-
-// setCacheEntryAtomic safely updates a cache entry
-func (gs *GlobalState) setCacheEntryAtomic(path string, fingerprint [32]byte, info os.FileInfo) {
-	gs.certCacheLock.Lock()
-	defer gs.certCacheLock.Unlock()
-
-	// Validate that the file still exists before caching
-	if _, err := os.Stat(path); err != nil {
-		log.WithFields(log.Fields{
-			"path":  path,
-			"error": err,
-		}).Debug("Skipping cache update for non-existent file")
-		return
-	}
-
-	gs.certCache[path] = CachedCertMeta{
-		Fingerprint: fingerprint,
-		ModTime:     info.ModTime(),
-		Size:        info.Size(),
-	}
-}
-
-// loadCacheFromFile loads certificate cache from disk
-func (gs *GlobalState) loadCacheFromFile(path string) error {
-	if path == "" {
-		log.Debug("No cache file path specified, skipping cache load")
-		return nil
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.WithError(err).WithField("cache_file", path).Info("No existing cache file or read error")
-		return nil
-	}
-
-	gs.certCacheLock.Lock()
-	defer gs.certCacheLock.Unlock()
-
-	if err := json.Unmarshal(data, &gs.certCache); err != nil {
-		log.WithError(err).WithField("cache_file", path).Warn("Failed to parse cache file, resetting cache")
-		gs.certCache = make(map[string]CachedCertMeta)
-		return err
-	}
-
-	log.WithFields(log.Fields{
-		"cache_file": path,
-		"entries":    len(gs.certCache),
-	}).Info("Certificate cache loaded successfully")
-
-	return nil
-}
-
-// saveCacheToFile saves certificate cache to disk
-func (gs *GlobalState) saveCacheToFile(path string) error {
-	if path == "" {
-		log.Debug("No cache file path specified, skipping cache save")
-		return nil
-	}
-
-	gs.certCacheLock.RLock()
-	cacheSize := len(gs.certCache)
-	// Create copy to avoid holding lock during I/O
-	cacheCopy := make(map[string]CachedCertMeta, cacheSize)
-	for k, v := range gs.certCache {
-		cacheCopy[k] = v
-	}
-	gs.certCacheLock.RUnlock()
-
-	data, err := json.MarshalIndent(cacheCopy, "", "  ")
-	if err != nil {
-		log.WithError(err).WithField("cache_file", path).Warn("Failed to marshal cache")
-		return err
-	}
-
-	// Create directory if needed
-	if err := utils.ValidateDirectoryCreation(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("cache directory creation failed: %w", err)
-	}
-
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		log.WithError(err).WithField("cache_file", path).Warn("Failed to write cache file")
-		return err
-	}
-
-	log.WithFields(log.Fields{
-		"cache_file": path,
-		"entries":    cacheSize,
-	}).Debug("Certificate cache saved successfully")
-
-	return nil
-}
-
-// pruneCacheNonExisting removes cache entries for files that no longer exist
-func (gs *GlobalState) pruneCacheNonExisting() int {
-	start := time.Now()
-	pruned := 0
-
-	gs.certCacheLock.Lock()
-	defer gs.certCacheLock.Unlock()
-
-	for path := range gs.certCache {
-		if _, err := os.Stat(path); err != nil {
-			delete(gs.certCache, path)
-			pruned++
-		}
-	}
-
-	if pruned > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries": pruned,
-			"duration":        time.Since(start),
-		}).Info("Pruned stale cache entries")
-	} else {
-		log.Debug("No stale cache entries found to prune")
-	}
-
-	return pruned
 }
 
 // Certificate Processing
@@ -495,22 +347,10 @@ func resetMetrics(clearCache bool) {
 	}
 
 	if clearCache {
-		globalState.certCacheLock.Lock()
-		globalState.certCache = make(map[string]CachedCertMeta)
-		// Reset cache statistics when clearing cache
-		oldHits := globalState.cacheHits
-		oldMisses := globalState.cacheMisses
-		globalState.cacheHits = 0
-		globalState.cacheMisses = 0
-		globalState.certCacheLock.Unlock()
-
-		log.WithFields(log.Fields{
-			"cleared_entries": "all",
-			"reset_hits":      oldHits,
-			"reset_misses":    oldMisses,
-		}).Info("Certificate cache and statistics cleared")
-
-		log.Info("Certificate cache cleared")
+		if cacheManager != nil {
+			cacheManager.Clear()
+			log.Info("Certificate cache cleared via cache manager")
+		}
 	}
 }
 
@@ -589,29 +429,18 @@ func addCertificateStats(checks map[string]string) {
 	checks["certs_parsed_total"] = fmt.Sprintf("%d", totalParsed)
 	checks["cert_parse_errors_total"] = fmt.Sprintf("%d", totalErrors)
 
-	// Add cache statistics to health checks
-	globalState.certCacheLock.RLock()
-	cacheSize := len(globalState.certCache)
-	hits := globalState.cacheHits
-	misses := globalState.cacheMisses
-	globalState.certCacheLock.RUnlock()
-
-	// Calculate and add hit rate to health checks
-	totalAccesses := hits + misses
-	var hitRate float64
-	if totalAccesses > 0 {
-		hitRate = float64(hits) / float64(totalAccesses) * 100
+	if cacheManager != nil {
+		stats := cacheManager.Stats()
+		checks["cache_entries_total"] = fmt.Sprintf("%d", stats.TotalEntries)
+		checks["cache_hit_rate"] = fmt.Sprintf("%.2f%%", stats.HitRate)
+		checks["cache_total_accesses"] = fmt.Sprintf("%d", stats.CacheHits+stats.CacheMisses)
+		checks["cache_file_path"] = stats.CacheFilePath
 	}
 
-	checks["cache_entries_total"] = fmt.Sprintf("%d", cacheSize)
-	checks["cache_hit_rate"] = fmt.Sprintf("%.2f%%", hitRate)
-	checks["cache_total_accesses"] = fmt.Sprintf("%d", totalAccesses)
-	checks["cache_file_path"] = globalState.cacheFilePath
-
 	// Check if cache file is writable
-	if globalState.cacheFilePath != "" {
+	if cacheManager != nil && cacheManager.Stats().CacheFilePath != "" {
 		checks["cache_file_writable"] = "ok"
-		if err := checkCacheFileWritable(globalState.cacheFilePath); err != nil {
+		if err := checkCacheFileWritable(cacheManager.Stats().CacheFilePath); err != nil {
 			checks["cache_file_writable"] = err.Error()
 		}
 	}
@@ -761,25 +590,15 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Get cache statistics
-	globalState.certCacheLock.RLock()
-	cacheSize := len(globalState.certCache)
-	hits := globalState.cacheHits
-	misses := globalState.cacheMisses
-	globalState.certCacheLock.RUnlock()
-
-	// Calculate hit rate
-	var hitRate float64
-	totalAccesses := hits + misses
-	if totalAccesses > 0 {
-		hitRate = float64(hits) / float64(totalAccesses) * 100
-	}
-
-	cacheStats := CacheStats{
-		TotalEntries:  cacheSize,
-		CacheFilePath: globalState.cacheFilePath,
-		HitRate:       hitRate,
-		LastPruneTime: "available_on_next_prune",
+	var cacheStats CacheStats
+	if cacheManager != nil {
+		stats := cacheManager.Stats()
+		cacheStats = CacheStats{
+			TotalEntries:  stats.TotalEntries,
+			CacheFilePath: stats.CacheFilePath,
+			HitRate:       stats.HitRate,
+			LastPruneTime: stats.LastPruneTime,
+		}
 	}
 
 	status := ConfigStatus{
@@ -815,35 +634,23 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 func collectCertificateInfo(cfg *config.Config) []certificate.Info {
 	var certificates []certificate.Info
 
-	globalState.certCacheLock.RLock()
-	paths := make([]string, 0, len(globalState.certCache))
-	for path := range globalState.certCache {
-		paths = append(paths, path)
-	}
-	globalState.certCacheLock.RUnlock()
+	// Since we don't have direct access to cached paths in the new cache manager,
+	// we need to scan directories to collect certificate info
+	for _, dir := range cfg.CertDirs {
+		processor := certificate.NewProcessor()
+		options := certificate.ProcessingOptions{
+			ExpiryThresholdDays: cfg.ExpiryThresholdDays,
+			DryRun:              false,
+			EnableWeakCrypto:    cfg.EnableWeakCryptoMetrics,
+		}
 
-	expiryThreshold := time.Duration(cfg.ExpiryThresholdDays) * 24 * time.Hour
-
-	for _, path := range paths {
-		if cert := loadCertificateFromFile(path); cert != nil {
-			// Extract the base filename from the full path for the API response
-			// This provides a clean filename without the full directory path
-			fileName := filepath.Base(path)
-
-			certInfo := certificate.Info{
-				CommonName:          cert.Subject.CommonName,
-				FileName:            fileName,
-				Issuer:              cert.Issuer.CommonName,
-				NotBefore:           cert.NotBefore,
-				NotAfter:            cert.NotAfter,
-				SANs:                cert.DNSNames,
-				ExpiringSoon:        time.Until(cert.NotAfter) <= expiryThreshold,
-				Type:                "leaf_certificate",
-				IssuerCode:          utils.DetermineIssuerCode(cert),
-				IsWeakKey:           utils.IsWeakKey(cert),
-				HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
+		scanner := certificate.NewScanner()
+		if files, err := scanner.ScanDirectory(dir); err == nil {
+			for _, fileInfo := range files {
+				if result, err := processor.ProcessFile(fileInfo.Path, options); err == nil && result.Info != nil {
+					certificates = append(certificates, *result.Info)
+				}
 			}
-			certificates = append(certificates, certInfo)
 		}
 	}
 
@@ -1291,54 +1098,9 @@ func migrateCacheFile(oldPath, newPath string) error {
 		return nil // No migration needed
 	}
 
-	log.WithFields(log.Fields{
-		"old_cache_file": oldPath,
-		"new_cache_file": newPath,
-	}).Info("Starting cache file migration")
-
-	// Perform cache consistency check before migration
-	preRemoved := globalState.pruneCacheNonExisting()
-	if preRemoved > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries": preRemoved,
-			"phase":           "pre_migration",
-		}).Info("Cleaned stale cache entries before migration")
+	if cacheManager != nil {
+		return cache.MigrateCache(oldPath, newPath)
 	}
-
-	// Save current cache to new location
-	if err := globalState.saveCacheToFile(newPath); err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"old_cache_file": oldPath,
-			"new_cache_file": newPath,
-		}).Error("Failed to save cache to new location during migration")
-		return fmt.Errorf("failed to save cache to new location: %w", err)
-	}
-
-	// Ensure cache consistency after migration by removing any stale entries
-	// that might have been created during the migration process
-	postRemoved := globalState.pruneCacheNonExisting()
-	if postRemoved > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries": postRemoved,
-			"phase":           "post_migration",
-		}).Info("Pruned stale entries after cache migration")
-
-		// Save the cleaned cache to the new location to ensure consistency
-		if err := globalState.saveCacheToFile(newPath); err != nil {
-			log.WithError(err).WithField("cache_file", newPath).Warn("Failed to save cleaned cache after migration")
-		} else {
-			log.WithField("cache_file", newPath).Debug("Saved cleaned cache after migration")
-		}
-	}
-
-	log.WithField("new_cache_file", newPath).Info("Global cache file path updated")
-
-	log.WithFields(log.Fields{
-		"old_cache_file":         oldPath,
-		"new_cache_file":         newPath,
-		"pre_migration_cleanup":  preRemoved,
-		"post_migration_cleanup": postRemoved,
-	}).Info("Cache file migration completed successfully")
 
 	return nil
 }
@@ -1471,11 +1233,13 @@ func runMainProcessingLoop(ctx context.Context) {
 			return
 		case <-cacheMaintenanceTicker.C:
 			// Periodic cache cleanup to handle any missed deletions
-			if removed := globalState.pruneCacheNonExisting(); removed > 0 {
-				log.WithField("removed_entries", removed).Debug("Periodic cache maintenance removed stale entries")
-				// Save updated cache after cleanup
-				if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
-					log.WithError(err).Debug("Failed to save cache after periodic maintenance")
+			if cacheManager != nil {
+				if removed := cacheManager.Prune(); removed > 0 {
+					log.WithField("removed_entries", removed).Debug("Periodic cache maintenance removed stale entries")
+					// Save updated cache after cleanup
+					if err := cacheManager.Save(cacheManager.Stats().CacheFilePath); err != nil {
+						log.WithError(err).Debug("Failed to save cache after periodic maintenance")
+					}
 				}
 			}
 		case _, ok := <-globalState.reloadCh:
@@ -1583,30 +1347,29 @@ func waitForWorkers(wg *sync.WaitGroup, workerCtx context.Context, workerCancel 
 // performPostScanMaintenance performs cleanup tasks after certificate scanning
 func performPostScanMaintenance() {
 	// Prune stale cache entries
-	if removed := globalState.pruneCacheNonExisting(); removed > 0 {
-		log.WithField("removed_entries", removed).Info("Pruned stale cache entries after scan")
+	if cacheManager != nil {
+		if removed := cacheManager.Prune(); removed > 0 {
+			log.WithField("removed_entries", removed).Info("Pruned stale cache entries after scan")
+		}
 	}
 
 	// Clear expired backoff entries
 	clearExpiredBackoffs()
 
 	// Save cache to disk
-	if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
-		log.WithError(err).Warn("Failed to save certificate cache after scan")
-	} else {
-		// Log cache statistics after successful save
-		globalState.certCacheLock.RLock()
-		cacheSize := len(globalState.certCache)
-		hits := globalState.cacheHits
-		misses := globalState.cacheMisses
-		globalState.certCacheLock.RUnlock()
-
-		log.WithFields(log.Fields{
-			"cache_entries": cacheSize,
-			"cache_hits":    hits,
-			"cache_misses":  misses,
-			"hit_rate":      fmt.Sprintf("%.2f%%", float64(hits)/float64(hits+misses)*100),
-		}).Debug("Cache statistics after scan maintenance")
+	if cacheManager != nil {
+		if err := cacheManager.Save(cacheManager.Stats().CacheFilePath); err != nil {
+			log.WithError(err).Warn("Failed to save certificate cache after scan")
+		} else {
+			// Log cache statistics after successful save
+			stats := cacheManager.Stats()
+			log.WithFields(log.Fields{
+				"cache_entries": stats.TotalEntries,
+				"cache_hits":    stats.CacheHits,
+				"cache_misses":  stats.CacheMisses,
+				"hit_rate":      fmt.Sprintf("%.2f%%", stats.HitRate),
+			}).Debug("Cache statistics after scan maintenance")
+		}
 	}
 
 	// Update reload timestamp
@@ -1621,9 +1384,10 @@ func performPostScanMaintenance() {
 // metrics are working correctly and that counts reflect reality
 func validateMetricConsistency() {
 	// Get current certificate count from cache
-	globalState.certCacheLock.RLock()
-	totalCertsInCache := len(globalState.certCache)
-	globalState.certCacheLock.RUnlock()
+	var totalCertsInCache int
+	if cacheManager != nil {
+		totalCertsInCache = cacheManager.Size()
+	}
 
 	log.WithFields(log.Fields{
 		"certificates_in_cache": totalCertsInCache,
@@ -1706,13 +1470,9 @@ func handleFileSystemEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
 	if event.Op&fsnotify.Remove != 0 {
 		// Immediately remove from cache if it's a certificate file
 		if utils.IsCertificateFile(filepath.Base(event.Name)) {
-			globalState.certCacheLock.Lock()
-			if _, exists := globalState.certCache[event.Name]; exists {
-				delete(globalState.certCache, event.Name)
-				globalState.certCacheLock.Unlock()
+			if cacheManager != nil {
+				cacheManager.Delete(event.Name)
 				logger.WithField("cache_entry", event.Name).Debug("Removed deleted certificate from cache")
-			} else {
-				globalState.certCacheLock.Unlock()
 			}
 		}
 
@@ -1720,22 +1480,8 @@ func handleFileSystemEvent(watcher *fsnotify.Watcher, event fsnotify.Event) {
 		if info, err := os.Stat(event.Name); os.IsNotExist(err) || (err == nil && info.IsDir()) {
 			removeDirectoryFromWatcher(watcher, event.Name)
 
-			// Remove all cache entries for files in deleted directory
-			globalState.certCacheLock.Lock()
-			removed := 0
-			for cachePath := range globalState.certCache {
-				if strings.HasPrefix(cachePath, event.Name) {
-					delete(globalState.certCache, cachePath)
-					removed++
-				}
-			}
-			globalState.certCacheLock.Unlock()
-			if removed > 0 {
-				logger.WithFields(log.Fields{
-					"removed_entries": removed,
-					"directory":       event.Name,
-				}).Debug("Removed cache entries for deleted directory")
-			}
+			// Note: Directory removal cache cleanup will be handled by periodic pruning
+			logger.WithField("directory", event.Name).Debug("Directory removed, cache will be pruned on next cycle")
 		}
 	}
 
@@ -2135,24 +1881,23 @@ func main() {
 	initLogger(cfg.LogFile, cfg.DryRun)
 
 	// Initialize cache
-	globalState.cacheFilePath = cfg.CacheFile
-	if err := globalState.loadCacheFromFile(globalState.cacheFilePath); err != nil {
+	cacheConfig := cache.Config{
+		FilePath:    cfg.CacheFile,
+		AutoSave:    false,
+		MaxEntries:  0, // No limit
+		EnableStats: true,
+	}
+	cacheManager = cache.NewManager(cacheConfig)
+
+	if err := cacheManager.Load(cfg.CacheFile); err != nil {
 		log.WithError(err).Warn("Cache loading failed, starting with empty cache")
-
-		// Reset cache statistics on failed load
-		globalState.certCacheLock.Lock()
-		globalState.cacheHits = 0
-		globalState.cacheMisses = 0
-		globalState.certCacheLock.Unlock()
-
-		log.Info("Cache statistics reset due to failed cache load")
 	}
 
 	// Prune stale cache entries
-	if removed := globalState.pruneCacheNonExisting(); removed > 0 {
+	if removed := cacheManager.Prune(); removed > 0 {
 		log.WithField("removed_entries", removed).Info("Removed stale cache entries during startup")
 
-		if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
+		if err := cacheManager.Save(cfg.CacheFile); err != nil {
 			log.WithError(err).Warn("Failed to save cache after pruning")
 		} else {
 			log.Info("Cache saved successfully after startup pruning")
@@ -2162,15 +1907,13 @@ func main() {
 	}
 
 	// Log initial cache state
-	globalState.certCacheLock.RLock()
-	initialCacheSize := len(globalState.certCache)
-	globalState.certCacheLock.RUnlock()
 
+	stats := cacheManager.Stats()
 	log.WithFields(log.Fields{
-		"cache_file":    globalState.cacheFilePath,
-		"cache_entries": initialCacheSize,
-		"cache_hits":    0,
-		"cache_misses":  0,
+		"cache_file":    stats.CacheFilePath,
+		"cache_entries": stats.TotalEntries,
+		"cache_hits":    stats.CacheHits,
+		"cache_misses":  stats.CacheMisses,
 	}).Info("Certificate cache initialized for startup")
 
 	// Log startup information
@@ -2256,24 +1999,22 @@ func performGracefulShutdown(server *http.Server, watcher *fsnotify.Watcher) {
 	shutdownHTTPServer(server)
 
 	// Log final cache statistics before shutdown
-	globalState.certCacheLock.RLock()
-	finalCacheSize := len(globalState.certCache)
-	finalHits := globalState.cacheHits
-	finalMisses := globalState.cacheMisses
-	globalState.certCacheLock.RUnlock()
 
-	log.WithFields(log.Fields{
-		"final_cache_entries": finalCacheSize,
-		"total_cache_hits":    finalHits,
-		"total_cache_misses":  finalMisses,
-		"final_hit_rate":      fmt.Sprintf("%.2f%%", float64(finalHits)/float64(finalHits+finalMisses)*100),
-	}).Info("Final cache statistics before shutdown")
+	if cacheManager != nil {
+		stats := cacheManager.Stats()
+		log.WithFields(log.Fields{
+			"final_cache_entries": stats.TotalEntries,
+			"total_cache_hits":    stats.CacheHits,
+			"total_cache_misses":  stats.CacheMisses,
+			"final_hit_rate":      fmt.Sprintf("%.2f%%", stats.HitRate),
+		}).Info("Final cache statistics before shutdown")
 
-	// Save final cache state
-	if err := globalState.saveCacheToFile(globalState.cacheFilePath); err != nil {
-		log.WithError(err).Warn("Failed to save cache during shutdown")
-	} else {
-		log.Info("Certificate cache saved successfully during shutdown")
+		// Save final cache state
+		if err := cacheManager.Save(stats.CacheFilePath); err != nil {
+			log.WithError(err).Warn("Failed to save cache during shutdown")
+		} else {
+			log.Info("Certificate cache saved successfully during shutdown")
+		}
 	}
 }
 
