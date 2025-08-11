@@ -12,9 +12,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -657,27 +655,27 @@ func collectCertificateInfo(cfg *config.Config) []certificate.Info {
 	return certificates
 }
 
-// loadCertificateFromFile loads and parses a certificate from a file
-func loadCertificateFromFile(path string) *x509.Certificate {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
+// // loadCertificateFromFile loads and parses a certificate from a file
+// func loadCertificateFromFile(path string) *x509.Certificate {
+// 	raw, err := os.ReadFile(path)
+// 	if err != nil {
+// 		return nil
+// 	}
 
-	// Try PEM first
-	if block, _ := pem.Decode(raw); block != nil && block.Type == "CERTIFICATE" {
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-			return cert
-		}
-	}
+// 	// Try PEM first
+// 	if block, _ := pem.Decode(raw); block != nil && block.Type == "CERTIFICATE" {
+// 		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+// 			return cert
+// 		}
+// 	}
 
-	// Try DER
-	if cert, err := x509.ParseCertificate(raw); err == nil {
-		return cert
-	}
+// 	// Try DER
+// 	if cert, err := x509.ParseCertificate(raw); err == nil {
+// 		return cert
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
 // Health Check Functions
 // =====================
@@ -1393,14 +1391,6 @@ func validateMetricConsistency() {
 		"certificates_in_cache": totalCertsInCache,
 		"validation":            "post_scan_metrics",
 	}).Debug("Post-scan metric consistency check")
-
-	// Additional validation could include:
-	// - Comparing metric totals against expected counts
-	// - Verifying that no certificates were double-counted
-	// - Ensuring removed certificates don't contribute to current counts
-
-	// This function serves as a hook for future metric validation enhancements
-	// and provides a clear audit trail of metric state after each scan cycle
 }
 
 // Runtime Metrics Collection
