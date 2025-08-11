@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/brandonhon/cert-monitor/internal/config"
+	"github.com/brandonhon/cert-monitor/internal/certificate"
 	"github.com/brandonhon/cert-monitor/pkg/utils"
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
@@ -99,20 +100,20 @@ type MetricsCollector struct {
 	CertIssuerCode          *prometheus.GaugeVec
 }
 
-// CertificateInfo represents parsed certificate data
-type CertificateInfo struct {
-	CommonName          string    `json:"common_name"`
-	FileName            string    `json:"file_name"`
-	Issuer              string    `json:"issuer"`
-	NotBefore           time.Time `json:"not_before"`
-	NotAfter            time.Time `json:"not_after"`
-	SANs                []string  `json:"sans,omitempty"`
-	ExpiringSoon        bool      `json:"expiring_soon"`
-	Type                string    `json:"type"`
-	IssuerCode          int       `json:"issuer_code"`
-	IsWeakKey           bool      `json:"is_weak_key"`
-	HasDeprecatedSigAlg bool      `json:"has_deprecated_sig_alg"`
-}
+// // CertificateInfo represents parsed certificate data
+// type CertificateInfo struct {
+// 	CommonName          string    `json:"common_name"`
+// 	FileName            string    `json:"file_name"`
+// 	Issuer              string    `json:"issuer"`
+// 	NotBefore           time.Time `json:"not_before"`
+// 	NotAfter            time.Time `json:"not_after"`
+// 	SANs                []string  `json:"sans,omitempty"`
+// 	ExpiringSoon        bool      `json:"expiring_soon"`
+// 	Type                string    `json:"type"`
+// 	IssuerCode          int       `json:"issuer_code"`
+// 	IsWeakKey           bool      `json:"is_weak_key"`
+// 	HasDeprecatedSigAlg bool      `json:"has_deprecated_sig_alg"`
+// }
 
 // HealthResponse represents the health check response
 type HealthResponse struct {
@@ -428,11 +429,45 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 		}
 	}()
 
+	// Create certificate processor
+	processor := certificate.NewProcessor()
+
+	// Create processing options
+	options := certificate.ProcessingOptions{
+		ExpiryThresholdDays: globalState.getConfig().ExpiryThresholdDays,
+		DryRun:              dryRun,
+		EnableWeakCrypto:    globalState.getConfig().EnableWeakCryptoMetrics,
+		// EnableWeakCrypto:    cfg.EnableWeakCryptoMetrics,
+	}
+
 	// Process certificates and track duplicates
+	// seen := make(map[string]int)
+	// err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+	// 	return processCertificateFile(path, d, err, dirPath, seen, dryRun)
+	// })
+	stats, duplicates, err := processor.ProcessDirectory(dirPath, options)
+	if err != nil {
+		logger.WithError(err).Warn("Certificate directory processing failed")
+		registerScanFailure(dirPath)
+		return nil
+	}
+
+	// Process individual certificates for metrics if we have results
+	if !dryRun && shouldWriteMetrics() {
+		processIndividualCertificatesForMetrics(processor, dirPath, options, duplicates)
+	}
+
+	// Update metrics based on processing results
+	if !dryRun && shouldWriteMetrics() {
+		metrics.CertFilesTotal.WithLabelValues(dirPath).Add(float64(stats.FilesProcessed))
+		metrics.CertsParsedTotal.WithLabelValues(dirPath).Add(float64(stats.CertsParsed))
+	}
+
+	// Convert DuplicateMap to map[string]int for return compatibility
 	seen := make(map[string]int)
-	err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
-		return processCertificateFile(path, d, err, dirPath, seen, dryRun)
-	})
+	for fingerprint, count := range duplicates {
+		seen[fingerprint] = count
+	}
 
 	if err != nil {
 		logger.WithError(err).Warn("Directory walk failed")
@@ -447,209 +482,253 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 	return seen
 }
 
-// processCertificateFile processes a single certificate file during directory walk
-func processCertificateFile(path string, d fs.DirEntry, walkErr error, dirPath string, seen map[string]int, dryRun bool) error {
-	if walkErr != nil {
-		return nil // Continue walking despite errors
-	}
-
-	if d.IsDir() {
-		return handleDirectory(d)
-	}
-
-	if !utils.IsCertificateFile(d.Name()) {
-		return nil
-	}
-
-	logger := log.WithFields(log.Fields{
-		"file":      path,
-		"directory": dirPath,
-	})
-
-	// Check cache first
-	cached, info, found, err := globalState.getCacheEntryAtomic(path)
+// processIndividualCertificatesForMetrics processes certificates again to update individual metrics
+func processIndividualCertificatesForMetrics(processor certificate.Processor, dirPath string, options certificate.ProcessingOptions, duplicates certificate.DuplicateMap) {
+	// We need to scan the directory again to get individual certificate results
+	// This is a bit inefficient, but maintains compatibility with existing metrics
+	scanner := certificate.NewScanner()
+	files, err := scanner.ScanDirectory(dirPath)
 	if err != nil {
-		logger.WithError(err).Warn("File stat failed")
-		if !dryRun && shouldWriteMetrics() {
-			metrics.CertParseErrors.WithLabelValues(path).Inc()
-		}
-		return nil
+		log.WithError(err).WithField("directory", dirPath).Warn("Failed to scan directory for metrics processing")
+		return
 	}
 
-	if !dryRun && shouldWriteMetrics() {
-		metrics.CertFilesTotal.WithLabelValues(dirPath).Inc()
-	}
-
-	// Skip if file unchanged
-	if found && cached.ModTime.Equal(info.ModTime()) && cached.Size == info.Size() {
-		logger.Debug("Skipping unchanged file based on cache")
-
-		// Record cache hit
-		globalState.certCacheLock.Lock()
-		globalState.cacheHits++
-		globalState.certCacheLock.Unlock()
-
-		logger.WithField("cache_status", "hit").Debug("Cache hit for unchanged file")
-
-		return nil
-	}
-
-	// Record cache miss (file changed or not in cache)
-	globalState.certCacheLock.Lock()
-	globalState.cacheMisses++
-	globalState.certCacheLock.Unlock()
-
-	if found {
-		logger.WithFields(log.Fields{
-			"cache_status": "miss",
-			"reason":       "file_changed",
-			"old_mod_time": cached.ModTime,
-			"new_mod_time": info.ModTime(),
-			"old_size":     cached.Size,
-			"new_size":     info.Size(),
-		}).Debug("Cache miss due to file change")
-	} else {
-		logger.WithFields(log.Fields{
-			"cache_status": "miss",
-			"reason":       "not_in_cache",
-		}).Debug("Cache miss for new file")
-	}
-
-	// Process the certificate file
-	cert, err := parseCertificateFile(path, filepath.Ext(path))
-	if err != nil {
-		logger.WithError(err).Warn("Certificate parsing failed")
-		if !dryRun && shouldWriteMetrics() {
-			metrics.CertParseErrors.WithLabelValues(path).Inc()
-		}
-		return nil
-	}
-
-	if cert == nil {
-		logger.Debug("No valid certificate found in file")
-		return nil
-	}
-
-	if !dryRun && shouldWriteMetrics() {
-		metrics.CertsParsedTotal.WithLabelValues(dirPath).Inc()
-	}
-
-	// Log certificate file processing for debugging metric issues
-	log.WithFields(log.Fields{
-		"file":      path,
-		"directory": dirPath,
-	}).Debug("Successfully parsed certificate, proceeding to metrics update")
-
-	// Process certificate and update metrics
-	globalState.processCertificate(cert, path, dirPath, seen, dryRun, info)
-
-	logger.WithFields(log.Fields{
-		"common_name": cert.Subject.CommonName,
-		"issuer":      cert.Issuer.CommonName,
-		"not_after":   cert.NotAfter,
-		"sans":        len(cert.DNSNames),
-	}).Info("Certificate processed successfully")
-
-	return nil
-}
-
-// handleDirectory determines whether to process or skip a directory
-func handleDirectory(d fs.DirEntry) error {
-	dirName := strings.ToLower(d.Name())
-	if dirName == "old" || dirName == "working" {
-		log.WithField("directory", d.Name()).Info("Skipping excluded subdirectory")
-		return filepath.SkipDir
-	}
-	return nil
-}
-
-// parseCertificateFile parses a certificate file and returns the leaf certificate
-func parseCertificateFile(path, ext string) (*x509.Certificate, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-
-	if ext == ".der" {
-		return x509.ParseCertificate(raw)
-	}
-
-	// For PEM files, find the first (leaf) certificate
-	rest := raw
-	for {
-		block, remaining := pem.Decode(rest)
-		rest = remaining
-		if block == nil {
-			break
-		}
-
-		if block.Type != "CERTIFICATE" {
+	for _, fileInfo := range files {
+		result, err := processor.ProcessFile(fileInfo.Path, options)
+		if err != nil {
+			metrics.CertParseErrors.WithLabelValues(fileInfo.Path).Inc()
 			continue
 		}
 
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue // Try next block
+		if result.Certificate == nil || result.Info == nil {
+			continue
 		}
 
-		return cert, nil // Return first valid certificate (leaf)
-	}
+		// Get duplicate count for this certificate
+		fingerprint := fmt.Sprintf("%x", sha256.Sum256(result.Certificate.Raw))
+		duplicateCount := duplicates[fingerprint]
 
-	return nil, fmt.Errorf("no valid certificate found")
+		// Update individual certificate metrics
+		filename := filepath.Base(result.Info.FileName)
+		sanitizedFilename := utils.SanitizeLabelValue(filename)
+		sanitizedCN := utils.SanitizeLabelValue(result.Info.CommonName)
+
+		updateCertificateMetrics(result.Info, sanitizedCN, sanitizedFilename, duplicateCount)
+
+		log.WithFields(log.Fields{
+			"common_name": result.Info.CommonName,
+			"issuer":      result.Info.Issuer,
+			"not_after":   result.Info.NotAfter,
+			"sans":        len(result.Info.SANs),
+		}).Debug("Certificate processed successfully for metrics")
+	}
 }
 
-// processCertificate processes a parsed certificate and updates metrics
-func (gs *GlobalState) processCertificate(cert *x509.Certificate, path, dirPath string, seen map[string]int, dryRun bool, info os.FileInfo) {
-	filename := filepath.Base(path)
-	sanitizedFilename := utils.SanitizeLabelValue(filename)
-	sanitizedCN := utils.SanitizeLabelValue(cert.Subject.CommonName)
+// // processCertificateFile processes a single certificate file during directory walk
+// func processCertificateFile(path string, d fs.DirEntry, walkErr error, dirPath string, seen map[string]int, dryRun bool) error {
+// 	if walkErr != nil {
+// 		return nil // Continue walking despite errors
+// 	}
 
-	// Track duplicates
-	fingerprint := sha256.Sum256(cert.Raw)
-	fingerprintKey := fmt.Sprintf("%x", fingerprint)
+// 	if d.IsDir() {
+// 		return handleDirectory(d)
+// 	}
 
-	// Log certificate processing to help debug potential double-processing issues
-	log.WithFields(log.Fields{
-		"file":        filename,
-		"fingerprint": fingerprintKey[:16], // Show first 16 chars of fingerprint
-	}).Debug("Processing certificate for metrics")
+// 	if !utils.IsCertificateFile(d.Name()) {
+// 		return nil
+// 	}
 
-	seen[fingerprintKey]++
+// 	logger := log.WithFields(log.Fields{
+// 		"file":      path,
+// 		"directory": dirPath,
+// 	})
 
-	// Create certificate info
-	certInfo := &CertificateInfo{
-		CommonName:          cert.Subject.CommonName,
-		Issuer:              cert.Issuer.CommonName,
-		NotBefore:           cert.NotBefore,
-		NotAfter:            cert.NotAfter,
-		SANs:                cert.DNSNames,
-		Type:                "leaf_certificate",
-		IssuerCode:          utils.DetermineIssuerCode(cert),
-		IsWeakKey:           utils.IsWeakKey(cert),
-		HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
-	}
+// 	// Check cache first
+// 	cached, info, found, err := globalState.getCacheEntryAtomic(path)
+// 	if err != nil {
+// 		logger.WithError(err).Warn("File stat failed")
+// 		if !dryRun && shouldWriteMetrics() {
+// 			metrics.CertParseErrors.WithLabelValues(path).Inc()
+// 		}
+// 		return nil
+// 	}
 
-	// Additional validation logging for debugging metric consistency
-	log.WithFields(log.Fields{
-		"file":                  filename,
-		"common_name":           cert.Subject.CommonName,
-		"has_weak_key":          certInfo.IsWeakKey,
-		"has_deprecated_sigalg": certInfo.HasDeprecatedSigAlg,
-		"duplicate_count":       seen[fingerprintKey],
-		"dry_run":               dryRun,
-	}).Debug("Certificate analysis complete, updating metrics")
+// 	if !dryRun && shouldWriteMetrics() {
+// 		metrics.CertFilesTotal.WithLabelValues(dirPath).Inc()
+// 	}
 
-	// Update metrics if not in dry run mode
-	if !dryRun && shouldWriteMetrics() {
-		updateCertificateMetrics(certInfo, sanitizedCN, sanitizedFilename, seen[fingerprintKey])
-	}
+// 	// Skip if file unchanged
+// 	if found && cached.ModTime.Equal(info.ModTime()) && cached.Size == info.Size() {
+// 		logger.Debug("Skipping unchanged file based on cache")
 
-	// Update cache
-	gs.setCacheEntryAtomic(path, fingerprint, info)
-}
+// 		// Record cache hit
+// 		globalState.certCacheLock.Lock()
+// 		globalState.cacheHits++
+// 		globalState.certCacheLock.Unlock()
+
+// 		logger.WithField("cache_status", "hit").Debug("Cache hit for unchanged file")
+
+// 		return nil
+// 	}
+
+// 	// Record cache miss (file changed or not in cache)
+// 	globalState.certCacheLock.Lock()
+// 	globalState.cacheMisses++
+// 	globalState.certCacheLock.Unlock()
+
+// 	if found {
+// 		logger.WithFields(log.Fields{
+// 			"cache_status": "miss",
+// 			"reason":       "file_changed",
+// 			"old_mod_time": cached.ModTime,
+// 			"new_mod_time": info.ModTime(),
+// 			"old_size":     cached.Size,
+// 			"new_size":     info.Size(),
+// 		}).Debug("Cache miss due to file change")
+// 	} else {
+// 		logger.WithFields(log.Fields{
+// 			"cache_status": "miss",
+// 			"reason":       "not_in_cache",
+// 		}).Debug("Cache miss for new file")
+// 	}
+
+// 	// Process the certificate file
+// 	cert, err := parseCertificateFile(path, filepath.Ext(path))
+// 	if err != nil {
+// 		logger.WithError(err).Warn("Certificate parsing failed")
+// 		if !dryRun && shouldWriteMetrics() {
+// 			metrics.CertParseErrors.WithLabelValues(path).Inc()
+// 		}
+// 		return nil
+// 	}
+
+// 	if cert == nil {
+// 		logger.Debug("No valid certificate found in file")
+// 		return nil
+// 	}
+
+// 	if !dryRun && shouldWriteMetrics() {
+// 		metrics.CertsParsedTotal.WithLabelValues(dirPath).Inc()
+// 	}
+
+// 	// Log certificate file processing for debugging metric issues
+// 	log.WithFields(log.Fields{
+// 		"file":      path,
+// 		"directory": dirPath,
+// 	}).Debug("Successfully parsed certificate, proceeding to metrics update")
+
+// 	// Process certificate and update metrics
+// 	globalState.processCertificate(cert, path, dirPath, seen, dryRun, info)
+
+// 	logger.WithFields(log.Fields{
+// 		"common_name": cert.Subject.CommonName,
+// 		"issuer":      cert.Issuer.CommonName,
+// 		"not_after":   cert.NotAfter,
+// 		"sans":        len(cert.DNSNames),
+// 	}).Info("Certificate processed successfully")
+
+// 	return nil
+// }
+
+// // handleDirectory determines whether to process or skip a directory
+// func handleDirectory(d fs.DirEntry) error {
+// 	dirName := strings.ToLower(d.Name())
+// 	if dirName == "old" || dirName == "working" {
+// 		log.WithField("directory", d.Name()).Info("Skipping excluded subdirectory")
+// 		return filepath.SkipDir
+// 	}
+// 	return nil
+// }
+
+// // parseCertificateFile parses a certificate file and returns the leaf certificate
+// func parseCertificateFile(path, ext string) (*x509.Certificate, error) {
+// 	raw, err := os.ReadFile(path)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to read file: %w", err)
+// 	}
+
+// 	if ext == ".der" {
+// 		return x509.ParseCertificate(raw)
+// 	}
+
+// 	// For PEM files, find the first (leaf) certificate
+// 	rest := raw
+// 	for {
+// 		block, remaining := pem.Decode(rest)
+// 		rest = remaining
+// 		if block == nil {
+// 			break
+// 		}
+
+// 		if block.Type != "CERTIFICATE" {
+// 			continue
+// 		}
+
+// 		cert, err := x509.ParseCertificate(block.Bytes)
+// 		if err != nil {
+// 			continue // Try next block
+// 		}
+
+// 		return cert, nil // Return first valid certificate (leaf)
+// 	}
+
+// 	return nil, fmt.Errorf("no valid certificate found")
+// }
+
+// // processCertificate processes a parsed certificate and updates metrics
+// func (gs *GlobalState) processCertificate(cert *x509.Certificate, path, dirPath string, seen map[string]int, dryRun bool, info os.FileInfo) {
+// 	filename := filepath.Base(path)
+// 	sanitizedFilename := utils.SanitizeLabelValue(filename)
+// 	sanitizedCN := utils.SanitizeLabelValue(cert.Subject.CommonName)
+
+// 	// Track duplicates
+// 	fingerprint := sha256.Sum256(cert.Raw)
+// 	fingerprintKey := fmt.Sprintf("%x", fingerprint)
+
+// 	// Log certificate processing to help debug potential double-processing issues
+// 	log.WithFields(log.Fields{
+// 		"file":        filename,
+// 		"fingerprint": fingerprintKey[:16], // Show first 16 chars of fingerprint
+// 	}).Debug("Processing certificate for metrics")
+
+// 	seen[fingerprintKey]++
+
+// 	// Create certificate info
+// 	certInfo := &CertificateInfo{
+// 		CommonName:          cert.Subject.CommonName,
+// 		Issuer:              cert.Issuer.CommonName,
+// 		NotBefore:           cert.NotBefore,
+// 		NotAfter:            cert.NotAfter,
+// 		SANs:                cert.DNSNames,
+// 		Type:                "leaf_certificate",
+// 		IssuerCode:          utils.DetermineIssuerCode(cert),
+// 		IsWeakKey:           utils.IsWeakKey(cert),
+// 		HasDeprecatedSigAlg: utils.IsDeprecatedSigAlg(cert.SignatureAlgorithm),
+// 	}
+
+// 	// Additional validation logging for debugging metric consistency
+// 	log.WithFields(log.Fields{
+// 		"file":                  filename,
+// 		"common_name":           cert.Subject.CommonName,
+// 		"has_weak_key":          certInfo.IsWeakKey,
+// 		"has_deprecated_sigalg": certInfo.HasDeprecatedSigAlg,
+// 		"duplicate_count":       seen[fingerprintKey],
+// 		"dry_run":               dryRun,
+// 	}).Debug("Certificate analysis complete, updating metrics")
+
+// 	// Update metrics if not in dry run mode
+// 	if !dryRun && shouldWriteMetrics() {
+// 		updateCertificateMetrics(certInfo, sanitizedCN, sanitizedFilename, seen[fingerprintKey])
+// 	}
+
+// 	// Update cache
+// 	gs.setCacheEntryAtomic(path, fingerprint, info)
+// }
 
 // updateCertificateMetrics updates all certificate-related metrics
-func updateCertificateMetrics(certInfo *CertificateInfo, sanitizedCN, sanitizedFilename string, duplicateCount int) {
+// func updateCertificateMetrics(certInfo *CertificateInfo, sanitizedCN, sanitizedFilename string, duplicateCount int) {
+// func updateCertificateMetrics(certInfo *certificate.Info, sanitizedCN, sanitizedFilename string, duplicateCount int) {
+func updateCertificateMetrics(certInfo *certificate.Info, sanitizedCN, sanitizedFilename string, duplicateCount int) {
 	cfg := globalState.getConfig()
 
 	// Basic certificate metrics
@@ -659,7 +738,8 @@ func updateCertificateMetrics(certInfo *CertificateInfo, sanitizedCN, sanitizedF
 	metrics.CertIssuerCode.WithLabelValues(sanitizedCN, sanitizedFilename).Set(float64(certInfo.IssuerCode))
 
 	// SAN information
-	sanitizedSANs := prepareSANsForMetrics(certInfo.SANs)
+	// sanitizedSANs := prepareSANsForMetrics(certInfo.SANs)
+	sanitizedSANs := certificate.PrepareSANsForMetrics(certInfo.SANs)
 	metrics.CertInfo.WithLabelValues(certInfo.CommonName, sanitizedFilename, sanitizedSANs).Set(1)
 
 	// Weak crypto metrics (if enabled)
@@ -701,19 +781,19 @@ func updateCertificateMetrics(certInfo *CertificateInfo, sanitizedCN, sanitizedF
 	}
 }
 
-// prepareSANsForMetrics formats SANs for Prometheus metrics
-func prepareSANsForMetrics(sans []string) string {
-	if len(sans) == 0 {
-		return ""
-	}
+// // prepareSANsForMetrics formats SANs for Prometheus metrics
+// func prepareSANsForMetrics(sans []string) string {
+// 	if len(sans) == 0 {
+// 		return ""
+// 	}
 
-	limitedSANs := sans
-	if len(limitedSANs) > utils.MaxSANsExported {
-		limitedSANs = limitedSANs[:utils.MaxSANsExported]
-	}
+// 	limitedSANs := sans
+// 	if len(limitedSANs) > utils.MaxSANsExported {
+// 		limitedSANs = limitedSANs[:utils.MaxSANsExported]
+// 	}
 
-	return utils.SanitizeLabelValue(strings.Join(limitedSANs, ","))
-}
+// 	return utils.SanitizeLabelValue(strings.Join(limitedSANs, ","))
+// }
 
 // Scan Backoff Management
 // ======================
@@ -1160,8 +1240,12 @@ func configStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // collectCertificateInfo collects certificate information for the API
-func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
-	var certificates []CertificateInfo
+//
+//	func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
+//		var certificates []CertificateInfo
+// func collectCertificateInfo(cfg *config.Config) []certificate.Info {
+func collectCertificateInfo(cfg *config.Config) []certificate.Info {
+	var certificates []certificate.Info
 
 	globalState.certCacheLock.RLock()
 	paths := make([]string, 0, len(globalState.certCache))
@@ -1178,7 +1262,7 @@ func collectCertificateInfo(cfg *config.Config) []CertificateInfo {
 			// This provides a clean filename without the full directory path
 			fileName := filepath.Base(path)
 
-			certInfo := CertificateInfo{
+			certInfo := certificate.Info{
 				CommonName:          cert.Subject.CommonName,
 				FileName:            fileName,
 				Issuer:              cert.Issuer.CommonName,
