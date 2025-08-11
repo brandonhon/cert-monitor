@@ -35,7 +35,7 @@ func (a *DefaultAnalyzer) AnalyzeSecurity(cert *x509.Certificate) SecurityAnalys
 // CreateInfo creates a certificate info struct from a parsed certificate
 func (a *DefaultAnalyzer) CreateInfo(cert *x509.Certificate, filename string, options ProcessingOptions) *Info {
 	analysis := a.AnalyzeSecurity(cert)
-	
+
 	// Check if certificate is expiring soon
 	expiryThreshold := time.Duration(options.ExpiryThresholdDays) * 24 * time.Hour
 	expiringSoon := time.Until(cert.NotAfter) <= expiryThreshold

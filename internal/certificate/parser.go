@@ -49,16 +49,16 @@ func (p *DefaultParser) ParsePEM(data []byte) (*x509.Certificate, error) {
 		if block == nil {
 			break
 		}
-		
+
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
-		
+
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			continue // Try next block
 		}
-		
+
 		return cert, nil // Return first valid certificate (leaf)
 	}
 

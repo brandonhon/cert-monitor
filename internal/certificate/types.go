@@ -8,17 +8,17 @@ import (
 
 // Info represents parsed certificate data and metadata
 type Info struct {
-	CommonName          string    `json:"common_name"`
-	FileName            string    `json:"file_name"`
-	Issuer              string    `json:"issuer"`
-	NotBefore           time.Time `json:"not_before"`
-	NotAfter            time.Time `json:"not_after"`
-	SANs                []string  `json:"sans,omitempty"`
-	ExpiringSoon        bool      `json:"expiring_soon"`
-	Type                string    `json:"type"`
-	IssuerCode          int       `json:"issuer_code"`
-	IsWeakKey           bool      `json:"is_weak_key"`
-	HasDeprecatedSigAlg bool      `json:"has_deprecated_sig_alg"`
+	CommonName          string            `json:"common_name"`
+	FileName            string            `json:"file_name"`
+	Issuer              string            `json:"issuer"`
+	NotBefore           time.Time         `json:"not_before"`
+	NotAfter            time.Time         `json:"not_after"`
+	SANs                []string          `json:"sans,omitempty"`
+	ExpiringSoon        bool              `json:"expiring_soon"`
+	Type                string            `json:"type"`
+	IssuerCode          int               `json:"issuer_code"`
+	IsWeakKey           bool              `json:"is_weak_key"`
+	HasDeprecatedSigAlg bool              `json:"has_deprecated_sig_alg"`
 	Certificate         *x509.Certificate `json:"-"` // Don't marshal the full cert
 }
 
@@ -48,12 +48,12 @@ type ProcessingOptions struct {
 
 // DirectoryStats contains statistics about certificate directory processing
 type DirectoryStats struct {
-	FilesProcessed   int
-	CertsParsed      int
-	ParseErrors      int
-	DuplicatesFound  int
-	ProcessingTime   time.Duration
-	LastScanTime     time.Time
+	FilesProcessed  int
+	CertsParsed     int
+	ParseErrors     int
+	DuplicatesFound int
+	ProcessingTime  time.Duration
+	LastScanTime    time.Time
 }
 
 // FileInfo contains information about a certificate file

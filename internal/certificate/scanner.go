@@ -3,7 +3,6 @@ package certificate
 import (
 	"fmt"
 	"io/fs"
-	// "os"
 	"path/filepath"
 	"strings"
 
@@ -27,11 +26,11 @@ func (s *DefaultScanner) ScanDirectory(path string) ([]FileInfo, error) {
 			log.WithError(err).WithField("path", filePath).Warn("Error accessing file during scan")
 			return nil // Continue walking despite errors
 		}
-		
+
 		if d.IsDir() {
 			return s.handleDirectory(d)
 		}
-		
+
 		if !s.IsCertificateFile(d.Name()) {
 			return nil
 		}
@@ -58,7 +57,7 @@ func (s *DefaultScanner) ScanDirectory(path string) ([]FileInfo, error) {
 	}
 
 	log.WithFields(log.Fields{
-		"directory":        path,
+		"directory":         path,
 		"certificate_files": len(certFiles),
 	}).Debug("Directory scan completed")
 
@@ -73,7 +72,7 @@ func (s *DefaultScanner) IsCertificateFile(filename string) bool {
 // handleDirectory determines whether to process or skip a directory
 func (s *DefaultScanner) handleDirectory(d fs.DirEntry) error {
 	dirName := strings.ToLower(d.Name())
-	
+
 	// Skip excluded directories
 	excludedDirs := []string{"old", "working", "backup", "archive"}
 	for _, excluded := range excludedDirs {
@@ -82,16 +81,16 @@ func (s *DefaultScanner) handleDirectory(d fs.DirEntry) error {
 			return filepath.SkipDir
 		}
 	}
-	
+
 	return nil
 }
 
 // GetFileStats returns statistics about files in a directory
 func GetFileStats(files []FileInfo) map[string]interface{} {
 	stats := make(map[string]interface{})
-	
+
 	stats["total_files"] = len(files)
-	
+
 	if len(files) == 0 {
 		return stats
 	}

@@ -36,7 +36,7 @@ func NewProcessorWithDeps(parser Parser, analyzer Analyzer, scanner Scanner) Pro
 // ProcessDirectory processes all certificate files in a directory
 func (p *DefaultProcessor) ProcessDirectory(path string, options ProcessingOptions) (*DirectoryStats, DuplicateMap, error) {
 	start := time.Now()
-	
+
 	logger := log.WithField("directory", path)
 	logger.Info("Starting certificate directory processing")
 
@@ -81,13 +81,13 @@ func (p *DefaultProcessor) ProcessDirectory(path string, options ProcessingOptio
 
 		// Log processing details
 		logger.WithFields(log.Fields{
-			"file":         result.Info.FileName,
-			"common_name":  result.Info.CommonName,
-			"issuer":       result.Info.Issuer,
-			"expires":      result.Info.NotAfter,
-			"sans":         len(result.Info.SANs),
-			"weak_key":     result.Info.IsWeakKey,
-			"deprecated":   result.Info.HasDeprecatedSigAlg,
+			"file":        result.Info.FileName,
+			"common_name": result.Info.CommonName,
+			"issuer":      result.Info.Issuer,
+			"expires":     result.Info.NotAfter,
+			"sans":        len(result.Info.SANs),
+			"weak_key":    result.Info.IsWeakKey,
+			"deprecated":  result.Info.HasDeprecatedSigAlg,
 		}).Debug("Certificate processed successfully")
 	}
 
@@ -107,7 +107,7 @@ func (p *DefaultProcessor) ProcessDirectory(path string, options ProcessingOptio
 // ProcessFile processes a single certificate file
 func (p *DefaultProcessor) ProcessFile(path string, options ProcessingOptions) (*ScanResult, error) {
 	logger := log.WithField("file", path)
-	
+
 	// Parse the certificate
 	cert, err := p.parser.ParseFile(path)
 	if err != nil {
@@ -138,7 +138,7 @@ func (p *DefaultProcessor) ProcessFile(path string, options ProcessingOptions) (
 // ProcessFiles processes multiple certificate files
 func (p *DefaultProcessor) ProcessFiles(files []FileInfo, options ProcessingOptions) ([]*ScanResult, error) {
 	var results []*ScanResult
-	
+
 	for _, file := range files {
 		result, err := p.ProcessFile(file.Path, options)
 		if err != nil {
@@ -156,12 +156,12 @@ func (p *DefaultProcessor) ProcessFiles(files []FileInfo, options ProcessingOpti
 // GetDuplicatesByFingerprint returns certificates grouped by fingerprint
 func GetDuplicatesByFingerprint(results []*ScanResult) map[string][]*ScanResult {
 	duplicates := make(map[string][]*ScanResult)
-	
+
 	for _, result := range results {
 		if result.Certificate == nil {
 			continue
 		}
-		
+
 		fingerprint := sha256.Sum256(result.Certificate.Raw)
 		fingerprintKey := fmt.Sprintf("%x", fingerprint)
 		duplicates[fingerprintKey] = append(duplicates[fingerprintKey], result)
@@ -182,7 +182,7 @@ func GetDuplicatesByFingerprint(results []*ScanResult) map[string][]*ScanResult 
 func FilterExpiringSoon(results []*ScanResult, thresholdDays int) []*ScanResult {
 	var expiring []*ScanResult
 	threshold := time.Duration(thresholdDays) * 24 * time.Hour
-	
+
 	for _, result := range results {
 		if result.Info != nil && time.Until(result.Info.NotAfter) <= threshold {
 			expiring = append(expiring, result)
@@ -195,7 +195,7 @@ func FilterExpiringSoon(results []*ScanResult, thresholdDays int) []*ScanResult 
 // FilterWeakSecurity returns certificates with security issues
 func FilterWeakSecurity(results []*ScanResult) []*ScanResult {
 	var weak []*ScanResult
-	
+
 	for _, result := range results {
 		if result.Info != nil && (result.Info.IsWeakKey || result.Info.HasDeprecatedSigAlg) {
 			weak = append(weak, result)
