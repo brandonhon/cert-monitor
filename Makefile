@@ -35,16 +35,16 @@ build-static:
 	CGO_ENABLED=0 GOOS=linux $(GOBUILD) $(LDFLAGS) -a -installsuffix cgo -o $(BINARY_NAME)-static .
 
 # Multi-platform builds
-build-all: build-linux build-darwin #build-windows
+build-all: build-linux build-windows build-darwin
 
 build-linux:
 	@echo "Building for Linux..."
 	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-linux-amd64 .
 	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-linux-arm64 .
 
-# build-windows:
-# 	@echo "Building for Windows..."
-# 	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-windows-amd64.exe .
+build-windows:
+	@echo "Building for Windows..."
+	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o build/$(BINARY_NAME)-windows-amd64.exe .
 
 build-darwin:
 	@echo "Building for macOS..."
@@ -137,11 +137,19 @@ install-tools:
 # Linting
 lint:
 	@echo "Running golangci-lint..."
-	golangci-lint run --config .golangci.yml
+	@if [ -f .golangci.yml ]; then \
+		golangci-lint run --config .golangci.yml; \
+	else \
+		golangci-lint run; \
+	fi
 
 lint-fix:
 	@echo "Running golangci-lint with auto-fix..."
-	golangci-lint run --config .golangci.yml --fix
+	@if [ -f .golangci.yml ]; then \
+		golangci-lint run --config .golangci.yml --fix; \
+	else \
+		golangci-lint run --fix; \
+	fi
 
 # Docker
 docker-build:

@@ -55,20 +55,20 @@ func Default() *Config {
 }
 
 // Compare compares two configurations and returns differences
-func Compare(old, new *Config) Diff {
+func Compare(old, newCfg *Config) Diff {
 	return Diff{
-		CertDirsChanged:          !equalStringSlices(old.CertDirs, new.CertDirs),
-		LogFileChanged:           old.LogFile != new.LogFile,
-		PortChanged:              old.Port != new.Port,
-		BindAddressChanged:       old.BindAddress != new.BindAddress,
-		NumWorkersChanged:        old.NumWorkers != new.NumWorkers,
-		TLSConfigChanged:         old.TLSCertFile != new.TLSCertFile || old.TLSKeyFile != new.TLSKeyFile,
-		RuntimeMetricsChanged:    old.EnableRuntimeMetrics != new.EnableRuntimeMetrics,
-		WeakCryptoMetricsChanged: old.EnableWeakCryptoMetrics != new.EnableWeakCryptoMetrics,
-		PprofChanged:             old.EnablePprof != new.EnablePprof,
-		CacheFileChanged:         old.CacheFile != new.CacheFile,
-		ExpiryThresholdChanged:   old.ExpiryThresholdDays != new.ExpiryThresholdDays,
-		ClearCacheChanged:        old.ClearCacheOnReload != new.ClearCacheOnReload,
+		CertDirsChanged:          !equalStringSlices(old.CertDirs, newCfg.CertDirs),
+		LogFileChanged:           old.LogFile != newCfg.LogFile,
+		PortChanged:              old.Port != newCfg.Port,
+		BindAddressChanged:       old.BindAddress != newCfg.BindAddress,
+		NumWorkersChanged:        old.NumWorkers != newCfg.NumWorkers,
+		TLSConfigChanged:         old.TLSCertFile != newCfg.TLSCertFile || old.TLSKeyFile != newCfg.TLSKeyFile,
+		RuntimeMetricsChanged:    old.EnableRuntimeMetrics != newCfg.EnableRuntimeMetrics,
+		WeakCryptoMetricsChanged: old.EnableWeakCryptoMetrics != newCfg.EnableWeakCryptoMetrics,
+		PprofChanged:             old.EnablePprof != newCfg.EnablePprof,
+		CacheFileChanged:         old.CacheFile != newCfg.CacheFile,
+		ExpiryThresholdChanged:   old.ExpiryThresholdDays != newCfg.ExpiryThresholdDays,
+		ClearCacheChanged:        old.ClearCacheOnReload != newCfg.ClearCacheOnReload,
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1454,7 +1455,7 @@ func reloadConfigAndTrigger() {
 			triggerReload()
 		}
 	} else {
-		log.WithError(fmt.Errorf(result.Error)).Warn("Configuration hot-reload failed")
+		log.WithError(errors.New(result.Error)).Warn("Configuration hot-reload failed")
 	}
 }
 
