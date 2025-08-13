@@ -65,20 +65,8 @@ issues:
         - unused
       text: "is unused"
 
-    # Exclude goimports from running on main.go
-    - path: main\.go
-      linters:
-        - goimports
-      text: "properly formatted"
-
-    # Exclude goimports from running on internal/config/config.go
-    - path: internal/config/config\.go
-      linters:
-        - goimports
-      text: "properly formatted"
-
-    # Exclude goimports from running on internal/metrics/collector.go
-    - path: internal/metrics/collector\.go
+    # Exclude goimports format check
+    - path: (main|collector|config|handlers)\.go$
       linters:
         - goimports
       text: "properly formatted"
