@@ -350,7 +350,10 @@ func TestHandlerRegistration(t *testing.T) {
 	customHandlers := map[string]http.HandlerFunc{
 		"/test": func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("test"))
+			// w.Write([]byte("test"))
+			if _, err := w.Write([]byte("test")); err != nil {
+				t.Errorf("Failed to write response: %v", err)
+			}
 		},
 	}
 
