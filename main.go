@@ -12,14 +12,12 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"math/rand"
-	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
@@ -34,12 +32,10 @@ import (
 	"github.com/brandonhon/cert-monitor/internal/certificate"
 	"github.com/brandonhon/cert-monitor/internal/config"
 	"github.com/brandonhon/cert-monitor/internal/metrics"
+	"github.com/brandonhon/cert-monitor/internal/server"
 	"github.com/brandonhon/cert-monitor/pkg/utils"
 	"github.com/fsnotify/fsnotify"
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -64,20 +60,6 @@ type GlobalState struct {
 	watchedDirs     map[string]bool
 	watchedDirsLock sync.Mutex
 	mainWatcher     *fsnotify.Watcher
-}
-
-// HealthResponse represents the health check response
-type HealthResponse struct {
-	Status string            `json:"status"`
-	Checks map[string]string `json:"checks,omitempty"`
-}
-
-// CacheStats represents cache statistics for monitoring
-type CacheStats struct {
-	TotalEntries  int     `json:"total_entries"`
-	CacheFilePath string  `json:"cache_file_path"`
-	HitRate       float64 `json:"hit_rate"`
-	LastPruneTime string  `json:"last_prune_time,omitempty"`
 }
 
 // Global instances
@@ -350,395 +332,6 @@ func resetMetrics(clearCache bool) {
 			log.Info("Certificate cache cleared via cache manager")
 		}
 	}
-}
-
-// HTTP Handlers
-// =============
-
-// healthHandler provides comprehensive health check information
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	checks := make(map[string]string)
-	isHealthy := true
-	cfg := globalState.getConfig()
-
-	// Disk space checks
-	for _, dir := range cfg.CertDirs {
-		checkKey := "disk_space_" + utils.SanitizeLabelValue(dir)
-		if err := checkDiskSpace(dir); err != nil {
-			checks[checkKey] = err.Error()
-			isHealthy = false
-		} else {
-			checks[checkKey] = "ok"
-		}
-	}
-
-	// Log file writability
-	if err := checkLogWritable(cfg.LogFile); err != nil {
-		checks["log_file_writable"] = err.Error()
-		isHealthy = false
-	} else {
-		checks["log_file_writable"] = "ok"
-	}
-
-	// Prometheus registry health
-	if err := checkPrometheus(); err != nil {
-		checks["prometheus_registry"] = err.Error()
-		isHealthy = false
-	} else {
-		checks["prometheus_registry"] = "ok"
-	}
-
-	// Add configuration info
-	checks["worker_pool_size"] = fmt.Sprintf("%d", cfg.NumWorkers)
-	checks["certificate_directories"] = fmt.Sprintf("%d", len(cfg.CertDirs))
-	checks["hot_reload_enabled"] = fmt.Sprintf("%t", globalState.configFilePath != "")
-	checks["config_file"] = globalState.configFilePath
-
-	// Gather certificate statistics
-	addCertificateStats(checks)
-
-	// Prepare response
-	status := "ok"
-	statusCode := http.StatusOK
-	if !isHealthy {
-		status = "error"
-		statusCode = http.StatusInternalServerError
-	}
-
-	response := HealthResponse{
-		Status: status,
-		Checks: checks,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.WithError(err).Error("Failed to encode health check response")
-	}
-}
-
-// addCertificateStats adds certificate statistics to health checks
-func addCertificateStats(checks map[string]string) {
-	totalFiles, totalParsed, totalErrors := gatherCertificateMetrics()
-
-	checks["cert_scan_status"] = "complete"
-	checks["cert_files_total"] = fmt.Sprintf("%d", totalFiles)
-	checks["certs_parsed_total"] = fmt.Sprintf("%d", totalParsed)
-	checks["cert_parse_errors_total"] = fmt.Sprintf("%d", totalErrors)
-
-	if cacheManager != nil {
-		stats := cacheManager.Stats()
-		checks["cache_entries_total"] = fmt.Sprintf("%d", stats.TotalEntries)
-		checks["cache_hit_rate"] = fmt.Sprintf("%.2f%%", stats.HitRate)
-		checks["cache_total_accesses"] = fmt.Sprintf("%d", stats.CacheHits+stats.CacheMisses)
-		checks["cache_file_path"] = stats.CacheFilePath
-	}
-
-	// Check if cache file is writable
-	if cacheManager != nil && cacheManager.Stats().CacheFilePath != "" {
-		checks["cache_file_writable"] = "ok"
-		if err := checkCacheFileWritable(cacheManager.Stats().CacheFilePath); err != nil {
-			checks["cache_file_writable"] = err.Error()
-		}
-	}
-}
-
-// gatherCertificateMetrics collects certificate metrics from Prometheus
-func gatherCertificateMetrics() (int, int, int) {
-	totalFiles, totalParsed, totalErrors := 0, 0, 0
-
-	mfs, err := metricsRegistry.GatherMetrics()
-	if err != nil {
-		log.WithError(err).Warn("Failed to gather Prometheus metrics for health check")
-		return totalFiles, totalParsed, totalErrors
-	}
-
-	for _, mf := range mfs {
-		switch mf.GetName() {
-		case "ssl_cert_files_total":
-			totalFiles += sumCounterMetrics(mf)
-		case "ssl_certs_parsed_total":
-			totalParsed += sumCounterMetrics(mf)
-		case "ssl_cert_parse_errors_total":
-			totalErrors += sumCounterMetrics(mf)
-		}
-	}
-
-	return totalFiles, totalParsed, totalErrors
-}
-
-// sumCounterMetrics sums counter metrics from a metric family
-func sumCounterMetrics(mf *dto.MetricFamily) int {
-	total := 0
-	for _, m := range mf.GetMetric() {
-		if counter := m.GetCounter(); counter != nil {
-			total += int(counter.GetValue())
-		}
-	}
-	return total
-}
-
-// certsHandler provides detailed certificate information via JSON API
-func certsHandler(w http.ResponseWriter, r *http.Request) {
-	cfg := globalState.getConfig()
-	certificates := collectCertificateInfo(cfg)
-
-	w.Header().Set("Content-Type", "application/json")
-
-	if err := json.NewEncoder(w).Encode(certificates); err != nil {
-		log.WithError(err).Error("Failed to encode certificates response")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	log.WithField("certificate_count", len(certificates)).Debug("Served certificates API request")
-}
-
-// reloadConfigHandler provides an HTTP endpoint for manual configuration reload
-func reloadConfigHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	logger := log.WithField("endpoint", "/reload")
-	logger.Info("Manual configuration reload requested")
-
-	if globalState.configFilePath == "" {
-		logger.Warn("No configuration file path available for reload")
-		http.Error(w, "No configuration file configured", http.StatusBadRequest)
-		return
-	}
-
-	result := performHotConfigReload(globalState.configFilePath)
-
-	// Set appropriate HTTP status
-	statusCode := http.StatusOK
-	if !result.Success {
-		statusCode = http.StatusInternalServerError
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-
-	if err := json.NewEncoder(w).Encode(result); err != nil {
-		logger.WithError(err).Error("Failed to encode reload response")
-	}
-
-	// Trigger certificate rescan if needed
-	if result.Success && shouldTriggerRescan(result.AppliedChanges) {
-		logger.Info("Triggering certificate rescan due to configuration changes")
-
-		// Force cache reload if cache-related settings changed or if explicitly requested
-		cfg := globalState.getConfig()
-		if cfg.ClearCacheOnReload {
-			logger.Info("Cache will be cleared on next rescan due to configuration setting")
-		}
-
-		triggerReload()
-	}
-
-	logger.WithFields(log.Fields{
-		"success":          result.Success,
-		"applied_changes":  len(result.AppliedChanges),
-		"requires_restart": len(result.RequiresRestart),
-	}).Info("Manual configuration reload completed")
-}
-
-// configStatusHandler provides current configuration status and hot-reload capabilities
-func configStatusHandler(w http.ResponseWriter, r *http.Request) {
-	cfg := globalState.getConfig()
-	if cfg == nil {
-		http.Error(w, "No configuration available", http.StatusInternalServerError)
-		return
-	}
-
-	type ConfigStatus struct {
-		ConfigFile          string     `json:"config_file"`
-		HotReloadEnabled    bool       `json:"hot_reload_enabled"`
-		CertificateDirs     []string   `json:"certificate_dirs"`
-		NumWorkers          int        `json:"num_workers"`
-		Port                string     `json:"port"`
-		BindAddress         string     `json:"bind_address"`
-		ExpiryThresholdDays int        `json:"expiry_threshold_days"`
-		RuntimeMetrics      bool       `json:"runtime_metrics_enabled"`
-		WeakCryptoMetrics   bool       `json:"weak_crypto_metrics_enabled"`
-		PprofEnabled        bool       `json:"pprof_enabled"`
-		CacheFile           string     `json:"cache_file"`
-		ClearCacheOnReload  bool       `json:"clear_cache_on_reload"`
-		TLSEnabled          bool       `json:"tls_enabled"`
-		LastReloadTime      string     `json:"last_reload_time,omitempty"`
-		CacheStats          CacheStats `json:"cache_stats"`
-	}
-
-	// Get last reload time from Prometheus metric
-	lastReloadTime := ""
-	if mfs, err := prometheus.DefaultGatherer.Gather(); err == nil {
-		for _, mf := range mfs {
-			if mf.GetName() == "ssl_cert_last_reload_timestamp" {
-				for _, m := range mf.GetMetric() {
-					if gauge := m.GetGauge(); gauge != nil && gauge.GetValue() > 0 {
-						lastReloadTime = time.Unix(int64(gauge.GetValue()), 0).Format(time.RFC3339)
-						break
-					}
-				}
-				break
-			}
-		}
-	}
-
-	var cacheStats CacheStats
-	if cacheManager != nil {
-		stats := cacheManager.Stats()
-		cacheStats = CacheStats{
-			TotalEntries:  stats.TotalEntries,
-			CacheFilePath: stats.CacheFilePath,
-			HitRate:       stats.HitRate,
-			LastPruneTime: stats.LastPruneTime,
-		}
-	}
-
-	status := ConfigStatus{
-		ConfigFile:          globalState.configFilePath,
-		HotReloadEnabled:    globalState.configFilePath != "",
-		CertificateDirs:     cfg.CertDirs,
-		NumWorkers:          cfg.NumWorkers,
-		Port:                cfg.Port,
-		BindAddress:         cfg.BindAddress,
-		ExpiryThresholdDays: cfg.ExpiryThresholdDays,
-		RuntimeMetrics:      cfg.EnableRuntimeMetrics,
-		WeakCryptoMetrics:   cfg.EnableWeakCryptoMetrics,
-		PprofEnabled:        cfg.EnablePprof,
-		CacheFile:           cfg.CacheFile,
-		ClearCacheOnReload:  cfg.ClearCacheOnReload,
-		TLSEnabled:          cfg.TLSCertFile != "" && cfg.TLSKeyFile != "",
-		LastReloadTime:      lastReloadTime,
-		CacheStats:          cacheStats,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-
-	if err := json.NewEncoder(w).Encode(status); err != nil {
-		log.WithError(err).Error("Failed to encode config status response")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	log.WithField("endpoint", "/config").Debug("Served configuration status request")
-}
-
-// collectCertificateInfo collects certificate information for the API
-func collectCertificateInfo(cfg *config.Config) []certificate.Info {
-	var certificates []certificate.Info
-
-	// Since we don't have direct access to cached paths in the new cache manager,
-	// we need to scan directories to collect certificate info
-	for _, dir := range cfg.CertDirs {
-		processor := certificate.NewProcessor()
-		options := certificate.ProcessingOptions{
-			ExpiryThresholdDays: cfg.ExpiryThresholdDays,
-			DryRun:              false,
-			EnableWeakCrypto:    cfg.EnableWeakCryptoMetrics,
-		}
-
-		scanner := certificate.NewScanner()
-		if files, err := scanner.ScanDirectory(dir); err == nil {
-			for _, fileInfo := range files {
-				if result, err := processor.ProcessFile(fileInfo.Path, options); err == nil && result.Info != nil {
-					certificates = append(certificates, *result.Info)
-				}
-			}
-		}
-	}
-
-	return certificates
-}
-
-// // loadCertificateFromFile loads and parses a certificate from a file
-// func loadCertificateFromFile(path string) *x509.Certificate {
-// 	raw, err := os.ReadFile(path)
-// 	if err != nil {
-// 		return nil
-// 	}
-
-// 	// Try PEM first
-// 	if block, _ := pem.Decode(raw); block != nil && block.Type == "CERTIFICATE" {
-// 		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-// 			return cert
-// 		}
-// 	}
-
-// 	// Try DER
-// 	if cert, err := x509.ParseCertificate(raw); err == nil {
-// 		return cert
-// 	}
-
-// 	return nil
-// }
-
-// Health Check Functions
-// =====================
-
-// checkDiskSpace verifies adequate disk space is available
-func checkDiskSpace(dir string) error {
-	var stat unix.Statfs_t
-	if err := unix.Statfs(dir, &stat); err != nil {
-		return fmt.Errorf("failed to check disk space: %w", err)
-	}
-
-	availableBytes := stat.Bavail * uint64(stat.Bsize)
-	if availableBytes < utils.MinDiskSpaceBytes {
-		return fmt.Errorf("insufficient disk space: %d bytes available (minimum: %d)",
-			availableBytes, utils.MinDiskSpaceBytes)
-	}
-
-	return nil
-}
-
-// checkLogWritable verifies the log file is writable
-func checkLogWritable(logFile string) error {
-	if logFile == "" {
-		return nil // Logging to stdout/stderr
-	}
-
-	file, err := os.OpenFile(logFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
-	if err != nil {
-		return fmt.Errorf("log file not writable: %w", err)
-	}
-	defer file.Close()
-
-	return nil
-}
-
-// checkPrometheus verifies Prometheus metrics are available
-func checkPrometheus() error {
-	mfs, err := prometheus.DefaultGatherer.Gather()
-	if err != nil {
-		return fmt.Errorf("failed to gather metrics: %w", err)
-	}
-
-	if len(mfs) == 0 {
-		return fmt.Errorf("no metrics available")
-	}
-
-	return nil
-}
-
-// checkCacheFileWritable verifies the cache file is writable
-func checkCacheFileWritable(cacheFile string) error {
-	if cacheFile == "" {
-		return nil // No cache file configured
-	}
-
-	// Try to open cache file for writing (create if not exists)fcac
-	file, err := os.OpenFile(cacheFile, os.O_WRONLY|os.O_CREATE, 0o644)
-	if err != nil {
-		return fmt.Errorf("cache file not writable: %w", err)
-	}
-	defer file.Close()
-
-	return nil
 }
 
 // Logging and Initialization
@@ -1550,72 +1143,6 @@ func runConfigWatcher(ctx context.Context, configWatcher *fsnotify.Watcher) {
 	}
 }
 
-// HTTP Server Management
-// =====================
-
-// startHTTPServer starts the metrics and API server
-func startHTTPServer(ctx context.Context, cfg *config.Config) *http.Server {
-	// Setup HTTP routes
-	setupHTTPRoutes(cfg)
-
-	server := &http.Server{
-		Addr:         cfg.BindAddress + ":" + cfg.Port,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		defer log.Info("HTTP server goroutine shutting down")
-
-		log.WithFields(log.Fields{
-			"address":     server.Addr,
-			"tls_enabled": cfg.TLSCertFile != "" && cfg.TLSKeyFile != "",
-		}).Info("Starting HTTP server")
-
-		var err error
-		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-			err = server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
-		} else {
-			err = server.ListenAndServe()
-		}
-
-		if err != nil && err != http.ErrServerClosed {
-			log.WithError(err).Fatal("HTTP server failed")
-		}
-	}()
-
-	return server
-}
-
-// setupHTTPRoutes configures HTTP endpoints
-func setupHTTPRoutes(cfg *config.Config) {
-	http.Handle("/metrics", metricsRegistry.Handler())
-	http.HandleFunc("/healthz", healthHandler)
-	http.HandleFunc("/certs", certsHandler)
-	http.HandleFunc("/reload", reloadConfigHandler)
-	http.HandleFunc("/config", configStatusHandler)
-
-	if cfg.EnablePprof {
-		log.Info("pprof debug endpoints enabled at /debug/pprof/")
-	}
-
-	log.Info("HTTP routes configured successfully")
-}
-
-// shutdownHTTPServer gracefully shuts down the HTTP server
-func shutdownHTTPServer(server *http.Server) {
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), utils.GracefulShutdownTimeout)
-	defer cancel()
-
-	log.Info("Shutting down HTTP server gracefully")
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.WithError(err).Warn("HTTP server shutdown error")
-	} else {
-		log.Info("HTTP server shut down successfully")
-	}
-}
-
 // Command Line Interface
 // =====================
 
@@ -1952,21 +1479,44 @@ func main() {
 	// Setup configuration file watcher
 	go setupConfigWatcher(ctx, globalState.configFilePath)
 
-	// Start HTTP server
-	server := startHTTPServer(ctx, cfg)
+	// Initialize HTTP server
+	serverConfig := &server.Config{
+		Port:            cfg.Port,
+		BindAddress:     cfg.BindAddress,
+		TLSCertFile:     cfg.TLSCertFile,
+		TLSKeyFile:      cfg.TLSKeyFile,
+		EnablePprof:     cfg.EnablePprof,
+		ReadTimeout:     30 * time.Second,
+		WriteTimeout:    30 * time.Second,
+		IdleTimeout:     60 * time.Second,
+		ShutdownTimeout: 10 * time.Second,
+	}
+
+	serverDeps := &server.Dependencies{
+		Config:          cfg,
+		MetricsRegistry: metricsRegistry,
+		CacheManager:    cacheManager,
+		ConfigFilePath:  globalState.configFilePath,
+		ReloadChannel:   globalState.reloadCh,
+	}
+
+	httpServer := server.New(serverConfig, serverDeps)
+	if err := httpServer.Start(ctx); err != nil {
+		log.WithError(err).Fatal("Failed to start HTTP server")
+	}
 
 	// Wait for shutdown signal
 	<-ctx.Done()
 	log.Info("Shutdown signal received, beginning graceful shutdown")
 
 	// Perform graceful shutdown
-	performGracefulShutdown(server, watcher)
+	performGracefulShutdown(httpServer, watcher)
 
 	log.Info("SSL Certificate Monitor stopped successfully")
 }
 
 // performGracefulShutdown handles the graceful shutdown process
-func performGracefulShutdown(server *http.Server, watcher *fsnotify.Watcher) {
+func performGracefulShutdown(httpServer server.Server, watcher *fsnotify.Watcher) {
 	// Close reload channel
 	log.Info("Closing reload channel")
 	close(globalState.reloadCh)
@@ -1985,8 +1535,9 @@ func performGracefulShutdown(server *http.Server, watcher *fsnotify.Watcher) {
 	globalState.watchedDirsLock.Unlock()
 	globalState.mainWatcher = nil
 
-	// Shutdown HTTP server
-	shutdownHTTPServer(server)
+	if err := httpServer.Stop(context.Background()); err != nil {
+		log.WithError(err).Warn("HTTP server shutdown error")
+	}
 
 	// Log final cache statistics before shutdown
 
