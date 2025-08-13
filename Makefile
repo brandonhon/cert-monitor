@@ -170,6 +170,20 @@ benchmark: test-setup
 	@$(GOTEST) -bench=. -benchmem ./... || ($(MAKE) test-cleanup && exit 1)
 	@$(MAKE) test-cleanup
 
+# Comprehensive package testing
+test-packages: test-certificate test-metrics test-cache test-config test-server
+	@echo "All package tests completed"
+
+test-packages-race:
+	@echo "Running all package tests with race detector..."
+	$(GOTEST) -race -v ./internal/certificate/... ./internal/metrics/... ./internal/cache/... ./internal/config/... ./internal/server/...
+
+test-packages-coverage:
+	@echo "Running all package tests with coverage..."
+	$(GOTEST) -coverprofile=coverage-packages.out ./internal/certificate/... ./internal/metrics/... ./internal/cache/... ./internal/config/... ./internal/server/...
+	$(GOCMD) tool cover -html=coverage-packages.out -o coverage-packages.html
+	@echo "Package test coverage report generated: coverage-packages.html"
+
 # Unit tests without background app (for pure unit tests)
 test-unit:
 	@echo "Running unit tests only (no background app)..."
@@ -184,6 +198,44 @@ test-unit-coverage:
 	$(GOTEST) -coverprofile=coverage-unit.out ./internal/... ./pkg/...
 	$(GOCMD) tool cover -html=coverage-unit.out -o coverage-unit.html
 	@echo "Unit test coverage report generated: coverage-unit.html"
+
+# Server package specific tests
+test-server:
+	@echo "Running server package tests..."
+	$(GOTEST) -v ./internal/server/...
+
+test-server-race:
+	@echo "Running server package tests with race detector..."
+	$(GOTEST) -race -v ./internal/server/...
+
+test-server-coverage:
+	@echo "Running server package tests with coverage..."
+	$(GOTEST) -coverprofile=coverage-server.out ./internal/server/...
+	$(GOCMD) tool cover -html=coverage-server.out -o coverage-server.html
+	@echo "Server test coverage report generated: coverage-server.html"
+
+# Server integration tests
+test-server-integration:
+	@echo "Running server integration tests..."
+	@chmod +x ./scripts/test-server-integration.sh
+	@./scripts/test-server-integration.sh
+
+# Package-specific test targets
+test-certificate:
+	@echo "Running certificate package tests..."
+	$(GOTEST) -v ./internal/certificate/...
+
+test-metrics:
+	@echo "Running metrics package tests..."
+	$(GOTEST) -v ./internal/metrics/...
+
+test-cache:
+	@echo "Running cache package tests..."
+	$(GOTEST) -v ./internal/cache/...
+
+test-config:
+	@echo "Running config package tests..."
+	$(GOTEST) -v ./internal/config/...
 
 # Test debugging helpers
 test-logs:
@@ -208,10 +260,6 @@ test-status:
 	else \
 		echo "No PID file found"; \
 	fi
-
-test-metrics:
-	@echo "Checking test application metrics..."
-	@curl -s http://localhost:$(TEST_PORT)/metrics | head -20
 
 # Manual test app management
 test-start: test-setup
@@ -359,6 +407,19 @@ help:
 	@echo "  test-unit      - Run unit tests only"
 	@echo "  test-unit-race - Run unit tests with race detector"
 	@echo "  test-unit-coverage - Generate unit test coverage"
+	@echo ""
+	@echo "Package-specific tests:"
+	@echo "  test-server    - Run server package tests"
+	@echo "  test-server-race - Run server tests with race detector"
+	@echo "  test-server-coverage - Generate server test coverage"
+	@echo "  test-server-integration - Run server integration tests"
+	@echo "  test-certificate - Run certificate package tests"
+	@echo "  test-metrics   - Run metrics package tests"
+	@echo "  test-cache     - Run cache package tests"
+	@echo "  test-config    - Run config package tests"
+	@echo "  test-packages  - Run all package tests"
+	@echo "  test-packages-race - Run all package tests with race detector"
+	@echo "  test-packages-coverage - Generate all package coverage"
 	@echo ""
 	@echo "Test management:"
 	@echo "  test-start     - Start test app in background"
