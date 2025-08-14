@@ -214,6 +214,29 @@ test-server-coverage:
 	$(GOCMD) tool cover -html=coverage-server.out -o coverage-server.html
 	@echo "Server test coverage report generated: coverage-server.html"
 
+# Cache package specific test targets
+test-cache:
+	@echo "Running cache package tests..."
+	$(GOTEST) -v ./internal/cache/...
+
+test-cache-race:
+	@echo "Running cache package tests with race detector..."
+	$(GOTEST) -race -v ./internal/cache/...
+
+test-cache-coverage:
+	@echo "Running cache package tests with coverage..."
+	$(GOTEST) -coverprofile=coverage-cache.out ./internal/cache/...
+	$(GOCMD) tool cover -html=coverage-cache.out -o coverage-cache.html
+	@echo "Cache test coverage report generated: coverage-cache.html"
+
+test-cache-short:
+	@echo "Running cache package short tests..."
+	$(GOTEST) -short -v ./internal/cache/...
+
+test-cache-benchmark:
+	@echo "Running cache package benchmarks..."
+	$(GOTEST) -bench=. -benchmem -v ./internal/cache/...
+
 # Server integration tests
 test-server-integration:
 	@echo "Running server integration tests..."
@@ -228,10 +251,6 @@ test-certificate:
 test-metrics:
 	@echo "Running metrics package tests..."
 	$(GOTEST) -v ./internal/metrics/...
-
-test-cache:
-	@echo "Running cache package tests..."
-	$(GOTEST) -v ./internal/cache/...
 
 test-config:
 	@echo "Running config package tests..."
@@ -416,6 +435,10 @@ help:
 	@echo "  test-certificate - Run certificate package tests"
 	@echo "  test-metrics   - Run metrics package tests"
 	@echo "  test-cache     - Run cache package tests"
+	@echo "  test-cache-race - Run cache tests with race detector"
+	@echo "  test-cache-coverage - Generate cache test coverage"
+	@echo "  test-cache-short - Run cache short tests"
+	@echo "  test-cache-benchmark - Run cache benchmarks"
 	@echo "  test-config    - Run config package tests"
 	@echo "  test-packages  - Run all package tests"
 	@echo "  test-packages-race - Run all package tests with race detector"
