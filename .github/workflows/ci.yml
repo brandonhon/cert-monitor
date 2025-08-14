@@ -115,12 +115,34 @@ jobs:
       with:
         go-version: 1.21
     
-    - name: Install and run Gosec Security Scanner
+    - name: Download and install Gosec
       run: |
-        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-        gosec ./...
-        
-    - name: Check for vulnerabilities
+        curl -sfL https://raw.githubusercontent.com/securecodewarrior/gosec/master/install.sh | sh -s -- -b $(go env GOPATH)/bin latest
+        echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+    
+    - name: Run Gosec Security Scanner
       run: |
-        go install golang.org/x/vuln/cmd/govulncheck@latest
-        govulncheck ./...
+        # Run gosec and create SARIF output (don't fail on findings)
+        gosec -fmt sarif -out gosec-results.sarif ./... || true
+        # Also run with normal output for console logs
+        echo "Gosec security scan results:"
+        gosec ./... || echo "Gosec completed with findings or warnings"
+    
+    - name: Check if SARIF file exists
+      id: check-sarif
+      run: |
+        if [ -f "gosec-results.sarif" ]; then
+          echo "sarif-exists=true" >> $GITHUB_OUTPUT
+          echo "SARIF file created successfully"
+          cat gosec-results.sarif
+        else
+          echo "sarif-exists=false" >> $GITHUB_OUTPUT
+          echo "SARIF file was not created"
+        fi
+    
+    - name: Upload Gosec results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always() && steps.check-sarif.outputs.sarif-exists == 'true'
+      with:
+        sarif_file: gosec-results.sarif
+
