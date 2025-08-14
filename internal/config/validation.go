@@ -170,7 +170,7 @@ func (c *Config) validateFilePaths() error {
 		logDir := filepath.Dir(c.LogFile)
 		if _, err := os.Stat(logDir); err != nil && os.IsNotExist(err) {
 			// Try to create directory if it doesn't exist
-			if err := os.MkdirAll(logDir, 0755); err != nil {
+			if err := os.MkdirAll(logDir, 0o755); err != nil {
 				return customerrors.NewValidationError("log_file", c.LogFile,
 					fmt.Sprintf("cannot create log directory: %v", err))
 			}
@@ -182,7 +182,7 @@ func (c *Config) validateFilePaths() error {
 		cacheDir := filepath.Dir(c.CacheFile)
 		if _, err := os.Stat(cacheDir); err != nil && os.IsNotExist(err) {
 			// Try to create directory if it doesn't exist
-			if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 				return customerrors.NewValidationError("cache_file", c.CacheFile,
 					fmt.Sprintf("cannot create cache directory: %v", err))
 			}

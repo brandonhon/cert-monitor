@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
 	// customerrors "github.com/brandonhon/cert-monitor/pkg/errors"
 )
 
@@ -29,7 +28,7 @@ func TestConfigValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "nil_config",
+			name:        "nil_config",
 			config:      nil,
 			expectError: true,
 			errorField:  "config",
