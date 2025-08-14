@@ -255,7 +255,7 @@ func TestConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(fileIndex int) {
 			defer wg.Done()
-			
+
 			filePath := testFiles[fileIndex]
 			_, fingerprint, info := createTestEntry()
 
@@ -308,7 +308,10 @@ func TestStatistics(t *testing.T) {
 	}
 
 	// Cache miss
-	manager.Get(tmpFile)
+	_, _, _, err := manager.Get(tmpFile)
+	if err != nil {
+		t.Fatalf("Get operation failed: %v", err)
+	}
 	stats = manager.Stats()
 	if stats.CacheMisses != 1 {
 		t.Errorf("Expected 1 cache miss, got %d", stats.CacheMisses)
@@ -316,7 +319,10 @@ func TestStatistics(t *testing.T) {
 
 	// Cache hit
 	manager.Set(tmpFile, fingerprint, info)
-	manager.Get(tmpFile)
+	_, _, _, err = manager.Get(tmpFile)
+	if err != nil {
+		t.Fatalf("Get operation failed: %v", err)
+	}
 	stats = manager.Stats()
 	if stats.CacheHits != 1 {
 		t.Errorf("Expected 1 cache hit, got %d", stats.CacheHits)
@@ -385,7 +391,10 @@ func BenchmarkGet(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		manager.Get(tmpFile)
+		_, _, _, err := manager.Get(tmpFile)
+		if err != nil {
+			b.Fatalf("Get operation failed: %v", err)
+		}
 	}
 }
 
@@ -401,7 +410,10 @@ func BenchmarkConcurrentAccess(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			manager.Set(tmpFile, fingerprint, info)
-			manager.Get(tmpFile)
+			_, _, _, err := manager.Get(tmpFile)
+			if err != nil {
+				b.Fatalf("Get operation failed: %v", err)
+			}
 		}
 	})
 }

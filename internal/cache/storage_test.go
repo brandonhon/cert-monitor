@@ -12,7 +12,7 @@ import (
 // TestLoadSave tests cache loading and saving to file
 func TestLoadSave(t *testing.T) {
 	manager := createTestManager(false)
-	
+
 	// Create temporary cache file
 	tmpDir, err := os.MkdirTemp("", "cache-test-*")
 	if err != nil {
@@ -21,7 +21,7 @@ func TestLoadSave(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	cacheFile := filepath.Join(tmpDir, "test-cache.json")
-	
+
 	// Create actual test files and add entries
 	testFiles := make([]string, 2)
 	testData := make([]struct {
@@ -29,12 +29,12 @@ func TestLoadSave(t *testing.T) {
 		fingerprint [32]byte
 		info        *FileInfo
 	}, 2)
-	
+
 	for i := 0; i < 2; i++ {
 		// Create real files
 		testFiles[i] = createTempFile(t, "certificate content "+string(rune(i)))
 		defer os.Remove(testFiles[i])
-		
+
 		testData[i] = struct {
 			path        string
 			fingerprint [32]byte
@@ -131,7 +131,7 @@ func TestLoadNonExistentFile(t *testing.T) {
 // TestLoadInvalidJSON tests loading from invalid JSON file
 func TestLoadInvalidJSON(t *testing.T) {
 	manager := createTestManager(false)
-	
+
 	// Create temp file with invalid JSON
 	tmpFile := createTempFile(t, "invalid json content {")
 	defer os.Remove(tmpFile)

@@ -157,7 +157,7 @@ func TestCachePerformance(t *testing.T) {
 // TestCacheConcurrency tests concurrent access patterns
 func TestCacheConcurrency(t *testing.T) {
 	manager := createTestManager(true)
-	const numGoroutines = 5   // Reduced for faster testing
+	const numGoroutines = 5 // Reduced for faster testing
 	const numOperationsPerGoroutine = 50
 
 	// Create test files for each goroutine
@@ -222,7 +222,7 @@ func TestCacheConcurrency(t *testing.T) {
 	}
 
 	totalOperations := numGoroutines * numOperationsPerGoroutine * 2 // Set + Get
-	t.Logf("Completed %d concurrent operations in %v (%.2f ops/sec)", 
+	t.Logf("Completed %d concurrent operations in %v (%.2f ops/sec)",
 		totalOperations, duration, float64(totalOperations)/duration.Seconds())
 
 	// Verify cache is in consistent state
