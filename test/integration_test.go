@@ -20,7 +20,7 @@ func TestApplicationHealth(t *testing.T) {
 	}
 }
 
-// TestMetricsEndpoint tests the metrics endpoint functionality  
+// TestMetricsEndpoint tests the metrics endpoint functionality
 func TestMetricsEndpoint(t *testing.T) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get("http://localhost:3000/metrics")
