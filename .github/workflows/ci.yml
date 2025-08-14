@@ -39,11 +39,19 @@ jobs:
     - name: Run go vet
       run: go vet ./...
     
-    - name: Run tests
+    - name: Check formatting
+      run: |
+        if [ -n "$(gofmt -l .)" ]; then
+          echo "Code is not formatted. Run 'make fmt' to fix."
+          gofmt -l .
+          exit 1
+        fi
+    
+    - name: Run tests with race detection
       run: go test -race -coverprofile=coverage.out ./...
     
-    - name: Run tests (short)
-      run: go test -short ./...
+    - name: Run integration tests
+      run: go test -race ./test/...
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
@@ -51,6 +59,7 @@ jobs:
         file: ./coverage.out
         flags: unittests
         name: codecov-umbrella
+      if: matrix.go-version == '1.21'  # Only upload coverage once
 
   build:
     runs-on: ubuntu-latest
@@ -64,17 +73,19 @@ jobs:
       with:
         go-version: 1.21
     
-    - name: Build
+    - name: Build main binary
       run: make build
     
-    - name: Build all platforms
+    - name: Test build-all target
       run: make build-all
+      if: startsWith(github.ref, 'refs/tags/')  # Only build all platforms on tags
     
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: cert-monitor-binaries
         path: build/
+      if: startsWith(github.ref, 'refs/tags/')
 
   lint:
     runs-on: ubuntu-latest
@@ -104,57 +115,12 @@ jobs:
       with:
         go-version: 1.21
     
-    - name: Download and install Gosec
-      run: |
-        curl -sfL https://raw.githubusercontent.com/securecodewarrior/gosec/master/install.sh | sh -s -- -b $(go env GOPATH)/bin latest
-        echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-    
     - name: Run Gosec Security Scanner
-      run: |
-        # Run gosec and create SARIF output (don't fail on findings)
-        gosec -fmt sarif -out gosec-results.sarif ./... || true
-        # Also run with normal output for console logs
-        echo "Gosec security scan results:"
-        gosec ./... || echo "Gosec completed with findings or warnings"
-    
-    - name: Check if SARIF file exists
-      id: check-sarif
-      run: |
-        if [ -f "gosec-results.sarif" ]; then
-          echo "sarif-exists=true" >> $GITHUB_OUTPUT
-          echo "SARIF file created successfully"
-          cat gosec-results.sarif
-        else
-          echo "sarif-exists=false" >> $GITHUB_OUTPUT
-          echo "SARIF file was not created"
-        fi
-    
-    - name: Upload Gosec results to GitHub Security tab
-      uses: github/codeql-action/upload-sarif@v3
-      if: always() && steps.check-sarif.outputs.sarif-exists == 'true'
+      uses: securecodewarrior/github-action-gosec@master
       with:
-        sarif_file: gosec-results.sarif
-
-  format-check:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: 1.21
-    
-    - name: Check formatting
+        args: './...'
+        
+    - name: Check for vulnerabilities
       run: |
-        # Show which files need formatting
-        UNFORMATTED=$(gofmt -l .)
-        if [ -n "$UNFORMATTED" ]; then
-          echo "The following files are not formatted:"
-          echo "$UNFORMATTED"
-          echo ""
-          echo "Please run 'gofmt -w .' or 'make fmt' to fix formatting"
-          exit 1
-        fi
-        echo "All files are properly formatted"
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck ./...
