@@ -579,13 +579,6 @@ func BenchmarkCertificateProcessing(b *testing.B) {
 	}
 }
 
-// TestCachePerformance tests certificate caching functionality
-func TestCachePerformance(t *testing.T) {
-	// Test cache hit/miss ratios
-	// This would test the actual caching logic
-	t.Log("Cache performance test placeholder")
-}
-
 // TestErrorHandling tests error handling scenarios
 func TestErrorHandling(t *testing.T) {
 	testCases := []struct {
