@@ -33,6 +33,7 @@ import (
 	"github.com/brandonhon/cert-monitor/internal/metrics"
 	"github.com/brandonhon/cert-monitor/internal/server"
 	"github.com/brandonhon/cert-monitor/internal/watcher"
+	"github.com/brandonhon/cert-monitor/internal/worker"
 	"github.com/brandonhon/cert-monitor/pkg/utils"
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
@@ -777,73 +778,15 @@ func processCertificateReload(ctx context.Context) {
 
 // processDirectoriesWithWorkers processes certificate directories using a worker pool
 func processDirectoriesWithWorkers(ctx context.Context, cfg *config.Config) {
-	dirJobs := make(chan string, len(cfg.CertDirs))
-	var wg sync.WaitGroup
+	log.WithField("worker_count", cfg.NumWorkers).Info("Starting certificate processing with worker pool")
 
-	workerCtx, workerCancel := context.WithCancel(ctx)
-	defer workerCancel()
-
-	// Start workers
-	for i := 0; i < cfg.NumWorkers; i++ {
-		wg.Add(1)
-		go certificateWorker(workerCtx, &wg, dirJobs, i)
-	}
-
-	// Queue directory jobs
-	for _, dir := range cfg.CertDirs {
-		select {
-		case <-workerCtx.Done():
-			log.Info("Context cancelled while queuing directory jobs")
-			close(dirJobs)
-			return
-		case dirJobs <- dir:
-		}
-	}
-	close(dirJobs)
-
-	// Wait for completion with timeout handling
-	waitForWorkers(&wg, workerCtx, workerCancel)
-
-	log.Info("All certificate processing workers completed")
-}
-
-// certificateWorker processes certificate directories from the job queue
-func certificateWorker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan string, workerID int) {
-	defer wg.Done()
-
-	logger := log.WithField("worker_id", workerID)
-	logger.Debug("Certificate worker started")
-
-	for dir := range jobs {
-		select {
-		case <-ctx.Done():
-			logger.Info("Worker cancelled, stopping")
-			return
-		default:
-		}
-
-		logger.WithField("directory", dir).Info("Processing certificate directory")
+	// Use the new worker package for processing directories
+	err := worker.ProcessDirectories(ctx, cfg.CertDirs, cfg.NumWorkers, func(dir string, recursive bool) {
 		processCertificateDirectory(dir, false)
-	}
+	})
 
-	logger.Debug("Certificate worker completed")
-}
-
-// waitForWorkers waits for all workers to complete with proper timeout handling
-func waitForWorkers(wg *sync.WaitGroup, workerCtx context.Context, workerCancel context.CancelFunc) {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-workerCtx.Done():
-		log.Warn("Context cancelled while waiting for workers")
-		workerCancel()
-		return
-	case <-done:
-		// All workers completed successfully
+	if err != nil {
+		log.WithError(err).Error("Worker pool processing failed")
 	}
 }
 
@@ -1245,6 +1188,20 @@ func main() {
 
 	// Initialize reload channel
 	globalState.reloadCh = make(chan struct{}, 1)
+
+	// Defer cleanup to ensure channels are closed properly
+	defer func() {
+		// Ensure reload channel is closed if not already done
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Debug("Reload channel was already closed during cleanup")
+				}
+			}()
+			close(globalState.reloadCh)
+		}()
+	}()
+
 	globalState.reloadCh <- struct{}{} // Trigger initial scan
 
 	// Start background services
@@ -1297,19 +1254,38 @@ func main() {
 
 // performGracefulShutdown handles the graceful shutdown process
 func performGracefulShutdown(httpServer server.Server, fileWatcher watcher.Watcher) {
+	shutdownTimeout := 10 * time.Second
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
 	// Close reload channel
 	log.Info("Closing reload channel")
-	close(globalState.reloadCh)
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warn("Reload channel was already closed")
+			}
+		}()
+		close(globalState.reloadCh)
+	}()
 
 	// Stop file system watcher
 	log.Info("Stopping file system watcher")
-	if err := fileWatcher.Stop(context.Background()); err != nil {
-		log.WithError(err).Warn("Error stopping file system watcher")
+	if fileWatcher != nil {
+		if err := fileWatcher.Stop(shutdownCtx); err != nil {
+			log.WithError(err).Warn("Error stopping file system watcher")
+		}
 	}
 
 	// Stop HTTP server
-	if err := httpServer.Stop(context.Background()); err != nil {
-		log.WithError(err).Warn("HTTP server shutdown error")
+	log.Info("Shutting down HTTP server")
+	if httpServer != nil {
+		if err := httpServer.Stop(shutdownCtx); err != nil {
+			log.WithError(err).Warn("HTTP server shutdown error")
+		} else {
+			log.Info("HTTP server shut down successfully")
+		}
 	}
 
 	// Log final cache statistics and save
@@ -1328,6 +1304,8 @@ func performGracefulShutdown(httpServer server.Server, fileWatcher watcher.Watch
 			log.Info("Certificate cache saved successfully during shutdown")
 		}
 	}
+
+	log.Info("Graceful shutdown completed")
 }
 
 // loadConfigFromFile loads configuration from file using new config package
