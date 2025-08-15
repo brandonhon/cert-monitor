@@ -66,7 +66,7 @@ issues:
       text: "is unused"
 
     # Exclude goimports format check
-    - path: (main|collector|config|handlers|manager)\.go$
+    - path: (main|collector|config|handlers|manager|backoff)\.go$
       linters:
         - goimports
       text: "properly formatted"

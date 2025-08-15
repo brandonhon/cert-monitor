@@ -16,14 +16,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math/rand"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +30,7 @@ import (
 	"github.com/brandonhon/cert-monitor/internal/config"
 	"github.com/brandonhon/cert-monitor/internal/metrics"
 	"github.com/brandonhon/cert-monitor/internal/server"
+	"github.com/brandonhon/cert-monitor/internal/state"
 	"github.com/brandonhon/cert-monitor/internal/watcher"
 	"github.com/brandonhon/cert-monitor/internal/worker"
 	"github.com/brandonhon/cert-monitor/pkg/utils"
@@ -46,47 +45,12 @@ var (
 	Commit  = "none"
 )
 
-// Global state management
-type GlobalState struct {
-	config         *config.Config
-	configMutex    sync.RWMutex
-	configFilePath string
-	reloadCh       chan struct{}
-
-	// Scan backoff tracking
-	scanBackoff     map[string]time.Time
-	scanBackoffLock sync.Mutex
-}
-
 // Global instances
 var (
-	globalState     *GlobalState
+	stateManager    state.Manager
 	cacheManager    cache.Manager
 	metricsRegistry *metrics.Registry
 )
-
-func init() {
-	globalState = &GlobalState{
-		scanBackoff: make(map[string]time.Time),
-	}
-}
-
-// Global State Management
-// ======================
-
-// getConfig safely retrieves the current configuration
-func (gs *GlobalState) getConfig() *config.Config {
-	gs.configMutex.RLock()
-	defer gs.configMutex.RUnlock()
-	return gs.config
-}
-
-// setConfig safely updates the global configuration
-func (gs *GlobalState) setConfig(cfg *config.Config) {
-	gs.configMutex.Lock()
-	defer gs.configMutex.Unlock()
-	gs.config = cfg
-}
 
 // Certificate Processing
 // =====================
@@ -95,18 +59,18 @@ func (gs *GlobalState) setConfig(cfg *config.Config) {
 func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 	logger := log.WithField("directory", dirPath)
 
-	if !shouldWriteMetrics() {
+	if !stateManager.ShouldWriteMetrics() {
 		logger.Info("Dry-run mode active, metrics writes disabled")
 	}
 
-	if shouldSkipScan(dirPath) {
+	if stateManager.ShouldSkipScan(dirPath) {
 		logger.Warn("Skipping scan due to backoff")
 		return nil
 	}
 
 	start := time.Now()
 	defer func() {
-		if !dryRun && shouldWriteMetrics() {
+		if !dryRun && stateManager.ShouldWriteMetrics() {
 			collector := metricsRegistry.GetCollector()
 			collector.CertScanDuration.WithLabelValues(dirPath).Observe(time.Since(start).Seconds())
 		}
@@ -114,7 +78,7 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 
 	if err := utils.ValidateDirectoryAccess(dirPath); err != nil {
 		logger.WithError(err).Warn("Directory validation failed, skipping scan")
-		registerScanFailure(dirPath)
+		stateManager.RegisterScanFailure(dirPath)
 		return nil
 	}
 
@@ -130,9 +94,9 @@ func processCertificateDirectory(dirPath string, dryRun bool) map[string]int {
 
 	// Create processing options
 	options := certificate.ProcessingOptions{
-		ExpiryThresholdDays: globalState.getConfig().ExpiryThresholdDays,
+		ExpiryThresholdDays: getConfig().ExpiryThresholdDays,
 		DryRun:              dryRun,
-		EnableWeakCrypto:    globalState.getConfig().EnableWeakCryptoMetrics,
+		EnableWeakCrypto:    getConfig().EnableWeakCryptoMetrics,
 	}
 
 	// Process certificates and track duplicates
@@ -222,95 +186,6 @@ func processIndividualCertificatesForMetrics(processor certificate.Processor, di
 	}
 }
 
-// Scan Backoff Management
-// ======================
-
-// registerScanFailure registers a scan failure and applies exponential backoff
-func registerScanFailure(dir string) {
-	globalState.scanBackoffLock.Lock()
-	defer globalState.scanBackoffLock.Unlock()
-
-	now := time.Now()
-	delay := 30 * time.Second
-
-	// Apply exponential backoff if already in backoff
-	if lastBackoff, exists := globalState.scanBackoff[dir]; exists && lastBackoff.After(now) {
-		delay = lastBackoff.Sub(now) * 2
-		if delay < 0 || delay > utils.MaxBackoff {
-			delay = utils.MaxBackoff
-		}
-	}
-
-	// Add jitter to prevent thundering herd
-	jitter := time.Duration(rand.Int63n(int64(10 * time.Second)))
-	nextScan := now.Add(delay + jitter)
-	globalState.scanBackoff[dir] = nextScan
-
-	log.WithFields(log.Fields{
-		"directory":     dir,
-		"backoff_delay": delay + jitter,
-		"retry_after":   nextScan.Format(time.RFC3339),
-	}).Warn("Scan failed, applying exponential backoff")
-}
-
-// shouldSkipScan checks if a directory should be skipped due to backoff
-func shouldSkipScan(dir string) bool {
-	globalState.scanBackoffLock.Lock()
-	defer globalState.scanBackoffLock.Unlock()
-
-	nextAllowed, exists := globalState.scanBackoff[dir]
-	if !exists {
-		return false
-	}
-
-	now := time.Now()
-	if now.Before(nextAllowed) {
-		log.WithFields(log.Fields{
-			"directory":      dir,
-			"backoff_until":  nextAllowed.Format(time.RFC3339),
-			"remaining_time": nextAllowed.Sub(now),
-		}).Debug("Directory scan skipped due to backoff")
-		return true
-	}
-
-	// Backoff expired, remove entry
-	delete(globalState.scanBackoff, dir)
-	log.WithField("directory", dir).Debug("Backoff period expired, allowing scan")
-	return false
-}
-
-// clearExpiredBackoffs removes expired backoff entries
-func clearExpiredBackoffs() {
-	globalState.scanBackoffLock.Lock()
-	defer globalState.scanBackoffLock.Unlock()
-
-	now := time.Now()
-	removed := 0
-
-	for dir, nextAllowed := range globalState.scanBackoff {
-		if now.After(nextAllowed) {
-			delete(globalState.scanBackoff, dir)
-			removed++
-		}
-	}
-
-	if removed > 0 {
-		log.WithFields(log.Fields{
-			"removed_entries":   removed,
-			"remaining_entries": len(globalState.scanBackoff),
-		}).Debug("Cleared expired backoff entries")
-	}
-}
-
-// Utility Functions
-// ================
-
-// shouldWriteMetrics determines if metrics should be written
-func shouldWriteMetrics() bool {
-	cfg := globalState.getConfig()
-	return cfg != nil && !cfg.DryRun
-}
-
 // resetMetrics resets all Prometheus metrics
 func resetMetrics(clearCache bool) {
 	if metricsRegistry != nil {
@@ -368,23 +243,24 @@ func initLogger(logPath string, dryRun bool) {
 
 // reloadConfigAndTrigger reloads configuration and triggers certificate rescan
 func reloadConfigAndTrigger() {
-	if globalState.configFilePath == "" {
+	configFilePath := stateManager.GetConfigFilePath()
+	if configFilePath == "" {
 		log.Warn("No configuration file path set, skipping reload")
 		return
 	}
 
-	result := performHotConfigReload(globalState.configFilePath)
+	result := performHotConfigReload(configFilePath)
 
 	if result.Success {
 		log.WithFields(log.Fields{
-			"config_file":      globalState.configFilePath,
+			"config_file":      configFilePath,
 			"applied_changes":  len(result.AppliedChanges),
 			"requires_restart": len(result.RequiresRestart),
 		}).Info("Configuration hot-reload completed")
 
 		// Only trigger certificate rescan if certificate-related settings changed
 		if shouldTriggerRescan(result.AppliedChanges) {
-			triggerReload()
+			stateManager.TriggerReload()
 		}
 	} else {
 		log.WithError(errors.New(result.Error)).Warn("Configuration hot-reload failed")
@@ -400,7 +276,7 @@ func performHotConfigReload(configPath string) config.ReloadResult {
 	}
 
 	// Get current configuration for comparison
-	oldConfig := globalState.getConfig()
+	oldConfig := stateManager.GetConfig()
 	if oldConfig == nil {
 		result.Error = "no current configuration available"
 		return result
@@ -423,7 +299,7 @@ func performHotConfigReload(configPath string) config.ReloadResult {
 	identifyRestartRequiredChanges(diff, &result)
 
 	// Update global configuration with applied changes
-	globalState.setConfig(newConfig)
+	stateManager.SetConfig(newConfig)
 
 	result.Success = true
 	return result
@@ -543,7 +419,7 @@ func identifyRestartRequiredChanges(diff config.Diff, result *config.ReloadResul
 func setupWatcher(ctx context.Context, cfg *config.Config) watcher.Watcher {
 	watcherConfig := &watcher.Config{
 		CertificateDirs: cfg.CertDirs,
-		ConfigFilePath:  globalState.configFilePath,
+		ConfigFilePath:  stateManager.GetConfigFilePath(),
 		DebounceDelay:   2 * time.Second,
 		ExcludedDirs:    []string{"old", "working", ".git", ".svn"},
 		OnFileChange: func(event watcher.Event) {
@@ -709,16 +585,6 @@ func findAddedDirectories(oldDirs, newDirs []string) []string {
 	return added
 }
 
-// triggerReload signals a certificate rescan
-func triggerReload() {
-	select {
-	case globalState.reloadCh <- struct{}{}:
-		log.Debug("Certificate rescan triggered")
-	default:
-		log.Debug("Certificate rescan already queued, skipping trigger")
-	}
-}
-
 // Main Application Logic
 // =====================
 
@@ -746,7 +612,7 @@ func runMainProcessingLoop(ctx context.Context) {
 					}
 				}
 			}
-		case _, ok := <-globalState.reloadCh:
+		case _, ok := <-stateManager.GetReloadChannel():
 			if !ok {
 				log.Info("Reload channel closed, stopping processing loop")
 				return
@@ -758,7 +624,7 @@ func runMainProcessingLoop(ctx context.Context) {
 
 // processCertificateReload handles a single certificate reload cycle
 func processCertificateReload(ctx context.Context) {
-	cfg := globalState.getConfig()
+	cfg := stateManager.GetConfig()
 
 	// Reset metrics
 	if cfg.ClearCacheOnReload {
@@ -800,7 +666,7 @@ func performPostScanMaintenance() {
 	}
 
 	// Clear expired backoff entries
-	clearExpiredBackoffs()
+	stateManager.ClearExpiredBackoffs()
 
 	// Save cache to disk
 	if cacheManager != nil {
@@ -846,7 +712,7 @@ func validateMetricConsistency() {
 
 // runRuntimeMetricsCollector periodically collects runtime metrics
 func runRuntimeMetricsCollector(ctx context.Context) {
-	if !globalState.getConfig().EnableRuntimeMetrics {
+	if !getConfig().EnableRuntimeMetrics {
 		log.Info("Runtime metrics collection disabled")
 		return
 	}
@@ -920,26 +786,21 @@ func parseCommandLineFlags() *config.Config {
 
 	flag.Parse()
 
-	// Store config file path globally
-	globalState.configFilePath = configFile
-
 	// Handle config validation mode
 	if checkConfig {
 		handleConfigValidation(configFile)
 	}
 
 	// Load configuration from file
-	if err := loadConfigFromFile(configFile); err != nil {
-		log.WithError(err).Fatal("Failed to load configuration")
+	cfg := config.Default()
+	if configFile != "" {
+		if err := loadConfigFromFile(configFile); err != nil {
+			log.WithError(err).Fatal("Failed to load configuration")
+		}
+		cfg, _ = config.Load(configFile)
 	}
 
 	// Apply command line overrides
-	cfg := globalState.getConfig()
-	if cfg == nil {
-		cfg = config.Default()
-		globalState.setConfig(cfg)
-	}
-
 	applyCommandLineOverrides(cfg, &certDirs, logFile, port, bindAddr, numWorkers,
 		dryRun, expiryDays, clearCache, tlsCert, tlsKey, enablePprof)
 	applyEnvironmentOverrides(cfg)
@@ -955,7 +816,7 @@ func handleConfigValidation(configFile string) {
 		log.WithError(err).Fatal("Configuration validation failed")
 	}
 
-	if err := config.Validate(globalState.getConfig()); err != nil {
+	if err := config.Validate(getConfig()); err != nil {
 		log.WithError(err).Fatal("Configuration validation failed")
 	}
 
@@ -1105,12 +966,62 @@ func performDryRun(cfg *config.Config) {
 	log.Info("Dry-run completed successfully")
 }
 
+// Wrapper functions for state manager
+func shouldWriteMetrics() bool {
+	if stateManager == nil {
+		return false
+	}
+	return stateManager.ShouldWriteMetrics()
+}
+
+func registerScanFailure(dir string) {
+	if stateManager != nil {
+		stateManager.RegisterScanFailure(dir)
+	}
+}
+
+func shouldSkipScan(dir string) bool {
+	if stateManager == nil {
+		return false
+	}
+	return stateManager.ShouldSkipScan(dir)
+}
+
+func triggerReload() {
+	if stateManager != nil {
+		stateManager.TriggerReload()
+	}
+}
+
+// Temporary config access for transition
+func getConfig() *config.Config {
+	if stateManager == nil {
+		return nil
+	}
+	return stateManager.GetConfig()
+}
+
+func setConfig(cfg *config.Config) {
+	if stateManager != nil {
+		stateManager.SetConfig(cfg)
+	}
+}
+
 // Main Function
 // =============
 
 func main() {
 	// Parse configuration and command line arguments
 	cfg := parseCommandLineFlags()
+
+	// Initialize cache first
+	cacheConfig := cache.Config{
+		FilePath:    cfg.CacheFile,
+		AutoSave:    false,
+		MaxEntries:  0, // No limit
+		EnableStats: true,
+	}
+	cacheManager = cache.NewManager(cacheConfig)
 
 	// Initialize metrics registry
 	metricsConfig := metrics.Config{
@@ -1119,19 +1030,22 @@ func main() {
 		Registry:                nil, // Use default registry
 	}
 	metricsRegistry = metrics.NewRegistry(metricsConfig)
-	log.Info("Metrics system initialized")
+
+	// Initialize state manager with dependencies
+	stateManagerDeps := &state.Dependencies{
+		CacheManager:    cacheManager,
+		MetricsRegistry: metricsRegistry,
+	}
+	stateManager = state.New(nil, stateManagerDeps)
+	defer stateManager.Close()
+
+	// Set configuration in state manager
+	stateManager.SetConfig(cfg)
+
+	log.Info("State management and metrics system initialized")
 
 	// Initialize logging
 	initLogger(cfg.LogFile, cfg.DryRun)
-
-	// Initialize cache
-	cacheConfig := cache.Config{
-		FilePath:    cfg.CacheFile,
-		AutoSave:    false,
-		MaxEntries:  0, // No limit
-		EnableStats: true,
-	}
-	cacheManager = cache.NewManager(cacheConfig)
 
 	if err := cacheManager.Load(cfg.CacheFile); err != nil {
 		log.WithError(err).Warn("Cache loading failed, starting with empty cache")
@@ -1151,7 +1065,6 @@ func main() {
 	}
 
 	// Log initial cache state
-
 	stats := cacheManager.Stats()
 	log.WithFields(log.Fields{
 		"cache_file":    stats.CacheFilePath,
@@ -1172,8 +1085,8 @@ func main() {
 		"dry_run":               cfg.DryRun,
 		"expiry_threshold_days": cfg.ExpiryThresholdDays,
 		"processing_mode":       "leaf_certificates_only",
-		"hot_reload_enabled":    globalState.configFilePath != "",
-		"config_file":           globalState.configFilePath,
+		"hot_reload_enabled":    stateManager.GetConfigFilePath() != "",
+		"config_file":           stateManager.GetConfigFilePath(),
 	}).Info("SSL Certificate Monitor starting")
 
 	// Handle dry-run mode
@@ -1186,23 +1099,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Initialize reload channel
-	globalState.reloadCh = make(chan struct{}, 1)
-
-	// Defer cleanup to ensure channels are closed properly
-	defer func() {
-		// Ensure reload channel is closed if not already done
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Debug("Reload channel was already closed during cleanup")
-				}
-			}()
-			close(globalState.reloadCh)
-		}()
-	}()
-
-	globalState.reloadCh <- struct{}{} // Trigger initial scan
+	// Trigger initial scan
+	stateManager.TriggerReload()
 
 	// Start background services
 	go runRuntimeMetricsCollector(ctx)
@@ -1233,8 +1131,7 @@ func main() {
 		Config:          cfg,
 		MetricsRegistry: metricsRegistry,
 		CacheManager:    cacheManager,
-		ConfigFilePath:  globalState.configFilePath,
-		ReloadChannel:   globalState.reloadCh,
+		ConfigFilePath:  stateManager.GetConfigFilePath(),
 	}
 
 	httpServer := server.New(serverConfig, serverDeps)
@@ -1267,7 +1164,6 @@ func performGracefulShutdown(httpServer server.Server, fileWatcher watcher.Watch
 				log.Warn("Reload channel was already closed")
 			}
 		}()
-		close(globalState.reloadCh)
 	}()
 
 	// Stop file system watcher
@@ -1308,14 +1204,19 @@ func performGracefulShutdown(httpServer server.Server, fileWatcher watcher.Watch
 	log.Info("Graceful shutdown completed")
 }
 
-// loadConfigFromFile loads configuration from file using new config package
 func loadConfigFromFile(configFile string) error {
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		return err
 	}
 
-	globalState.setConfig(cfg)
+	// Set configuration in state manager if it exists
+	if stateManager != nil {
+		stateManager.SetConfig(cfg)
+		if configFile != "" {
+			stateManager.SetConfigFilePath(configFile)
+		}
+	}
 
 	log.WithFields(log.Fields{
 		"config_file": configFile,
