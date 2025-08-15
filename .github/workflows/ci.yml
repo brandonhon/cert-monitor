@@ -20,16 +20,27 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: ${{ matrix.go-version }}
+        cache: false  # Disable built-in cache to use custom caching
     
-    - name: Set up Go module cache
+    - name: Cache Go modules
       uses: actions/cache@v4
+      id: cache-go
+      continue-on-error: true
       with:
         path: |
-          ~/go/pkg/mod
           ~/.cache/go-build
-        key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}-v3
         restore-keys: |
+          ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}-v2
           ${{ runner.os }}-go-${{ matrix.go-version }}-
+    
+    - name: Clean and retry on cache failure
+      if: steps.cache-go.outcome == 'failure'
+      run: |
+        echo "Cache restore failed, cleaning up..."
+        rm -rf ~/.cache/go-build ~/go/pkg/mod || true
+        go clean -modcache || true
     
     - name: Download dependencies
       run: |
@@ -53,6 +64,12 @@ jobs:
     - name: Run integration tests
       run: go test -race ./test/...
     
+    - name: Clean Go module cache on test failure
+      if: failure()
+      run: |
+        go clean -modcache || true
+        rm -rf ~/.cache/go-build || true
+    
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
       with:
@@ -72,6 +89,27 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: 1.21
+        cache: false  # Disable built-in cache to use custom caching
+    
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      id: cache-go-build
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-1.21-${{ hashFiles('**/go.sum') }}-v3
+        restore-keys: |
+          ${{ runner.os }}-go-1.21-${{ hashFiles('**/go.sum') }}-v2
+          ${{ runner.os }}-go-1.21-
+    
+    - name: Clean and retry on cache failure
+      if: steps.cache-go-build.outcome == 'failure'
+      run: |
+        echo "Cache restore failed, cleaning up..."
+        rm -rf ~/.cache/go-build ~/go/pkg/mod || true
+        go clean -modcache || true
     
     - name: Build main binary
       run: make build
@@ -97,6 +135,27 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: 1.21
+        cache: false  # Disable built-in cache to use custom caching
+    
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      id: cache-go-lint
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-1.21-${{ hashFiles('**/go.sum') }}-v3
+        restore-keys: |
+          ${{ runner.os }}-go-1.21-${{ hashFiles('**/go.sum') }}-v2
+          ${{ runner.os }}-go-1.21-
+    
+    - name: Clean and retry on cache failure
+      if: steps.cache-go-lint.outcome == 'failure'
+      run: |
+        echo "Cache restore failed, cleaning up..."
+        rm -rf ~/.cache/go-build ~/go/pkg/mod || true
+        go clean -modcache || true
     
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v3
@@ -114,6 +173,27 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: 1.21
+        cache: false  # Disable built-in cache to use custom caching
+    
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      id: cache-go-security
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-1.21-${{ hashFiles('**/go.sum') }}-v3
+        restore-keys: |
+          ${{ runner.os }}-go-1.21-${{ hashFiles('**/go.sum') }}-v2
+          ${{ runner.os }}-go-1.21-
+    
+    - name: Clean and retry on cache failure
+      if: steps.cache-go-security.outcome == 'failure'
+      run: |
+        echo "Cache restore failed, cleaning up..."
+        rm -rf ~/.cache/go-build ~/go/pkg/mod || true
+        go clean -modcache || true
     
     - name: Download and install Gosec
       run: |
@@ -145,4 +225,3 @@ jobs:
       if: always() && steps.check-sarif.outputs.sarif-exists == 'true'
       with:
         sarif_file: gosec-results.sarif
-
